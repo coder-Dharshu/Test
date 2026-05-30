@@ -67,9 +67,14 @@ SERVICES = [
         "color"  : "\033[92m",
     },
     {
-        "name"   : "Lego4-HITL-UI",
-        "cmd"    : [PYTHON, "lego4_hitl/hitl_ui.py"],
-        "health" : "http://localhost:7860",
+        "name"   : "Smart-Triage-HITL-Dashboard",
+        # Streamlit HITL Hub (replaces legacy Gradio dashboard on port 7860)
+        "cmd"    : [PYTHON, "-m", "streamlit", "run",
+                    "smart_triage/smart_triage_hitl_app.py",
+                    "--server.port", "8501",
+                    "--server.address", "0.0.0.0",
+                    "--server.headless", "true"],
+        "health" : "http://localhost:8501/healthz",
         "color"  : "\033[93m",
     },
 ]
@@ -141,19 +146,19 @@ def main():
         time.sleep(3)
 
     print(f"\n{BOLD}{'=' * 55}{RESET}")
-    print(f"{BOLD}[LIVE] Greencare AI is running!{RESET}")
-    print(f"  [1] API Gateway    --> http://localhost:8000/docs")
-    print(f"  [2] CPU Triage     --> http://localhost:8001/docs")
-    print(f"  [3] Groq Engine    --> http://localhost:8002/docs")
-    print(f"  [4] HITL Dashboard --> http://localhost:7860")
+    print(f"{BOLD}[LIVE] Greencare AI — Smart Triage is running!{RESET}")
+    print(f"  [1] API Gateway      --> http://localhost:8000/docs")
+    print(f"  [2] CPU Triage       --> http://localhost:8001/docs")
+    print(f"  [3] Groq Engine      --> http://localhost:8002/docs")
+    print(f"  [4] HITL Dashboard   --> http://localhost:8501  (Streamlit)")
     print(f"{BOLD}{'=' * 55}{RESET}")
     print("\nPress Ctrl+C to stop all services.\n")
 
     def open_browser():
-        time.sleep(10)
+        time.sleep(12)
         webbrowser.open("http://localhost:8000/docs")
         time.sleep(3)
-        webbrowser.open("http://localhost:7860")
+        webbrowser.open("http://localhost:8501")
     threading.Thread(target=open_browser, daemon=True).start()
 
     try:

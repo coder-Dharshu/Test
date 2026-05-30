@@ -37,6 +37,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
+# ── Smart Triage — Core Orchestrator & AST Compiler ────────────────────────
+try:
+    from smart_triage.orchestrator import SmartTriageOrchestrator, ExecutionPath
+    from smart_triage.ast_compiler import ASTCompiler
+    SMART_TRIAGE_AVAILABLE = True
+except ImportError as _st_err:
+    SMART_TRIAGE_AVAILABLE = False
+    logging.warning("smart_triage package not available: %s — falling back to legacy pipeline", _st_err)
+
 # ── Optional JWT auth (graceful fallback if jose not installed) ────────────
 try:
     from jose import JWTError, jwt
@@ -66,7 +75,27 @@ ASSETS_DIR   = "./extracted_assets"   # cropped logo/image assets from visual gr
 for d in [UPLOAD_DIR, PENDING_DIR, FINAL_DIR, REJECTED_DIR, ASSETS_DIR]:
     os.makedirs(d, exist_ok=True)
 
-ALLOWED_EXT = {".pdf", ".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".webp"}
+# ── Instantiate Smart Triage orchestrator (singleton) ──────────────────────
+_orchestrator: "SmartTriageOrchestrator | None" = None
+_ast_compiler:  "ASTCompiler | None"             = None
+
+def get_orchestrator():
+    global _orchestrator, _ast_compiler
+    if SMART_TRIAGE_AVAILABLE and _orchestrator is None:
+        _orchestrator = SmartTriageOrchestrator(
+            pcs_threshold            = float(os.environ.get("PCS_THRESHOLD", "0.50")),
+            ocr_confidence_threshold = float(os.environ.get("OCR_CONFIDENCE_THRESHOLD", "80.0")),
+            lego3_url                = LEGO3_URL,
+            lego2_temp_dir           = "./lego2_temp",
+        )
+        _ast_compiler = ASTCompiler()
+        logger.info(
+            "SmartTriageOrchestrator initialized (OCR confidence gate=%.0f%%)",
+            _orchestrator.ocr_confidence_threshold,
+        )
+    return _orchestrator, _ast_compiler
+
+ALLOWED_EXT = {".pdf", ".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".webp", ".xlsx", ".xls", ".csv", ".docx"}
 
 # In-memory job registry
 job_registry: dict[str, dict] = {}
@@ -272,68 +301,98 @@ def export_to_csv(extracted_data: dict) -> str:
 # Core pipeline (runs in FastAPI BackgroundTask)
 # ---------------------------------------------------------------------------
 def run_pipeline(file_path: str, job_id: str, source_filename: str):
-    logger.info("[%s] ▶ Pipeline started: %s", job_id, source_filename)
+    """
+    Smart Triage Pipeline (v2) — Replaces legacy lego2→lego3 HTTP chain.
+
+    Routing:
+      Track A  (digital PDF ≥50 chars)  → Programmatic extraction, zero API cost
+      Path 1   (PCS < 0.50)             → CPU OCR via pytesseract
+      Path 2   (PCS ≥ 0.50)             → Groq Vision LLM
+
+    Falls back to legacy lego2/lego3 HTTP chain if smart_triage not available.
+    """
+    logger.info("[%s] ▶ Smart Triage pipeline started: %s", job_id, source_filename)
     job_registry[job_id] = {"status": "processing", "filename": source_filename}
 
     try:
-        # ── Step 1: CPU Triage (Lego 2) ────────────────────────────────
-        with open(file_path, "rb") as fh:
-            triage_resp = requests.post(
-                f"{LEGO2_URL}/triage",
-                files={"file": (source_filename, fh)},
-                timeout=90,
-            )
-        triage_resp.raise_for_status()
-        triage = triage_resp.json()
-        routing = triage.get("routing")
-        logger.info("[%s] Routing: %s", job_id, routing)
+        orchestrator, ast_compiler = get_orchestrator()
 
-        # ── Step 2: Route decision ─────────────────────────────────────
-        if routing == "fast_track_complete":
-            pages     = triage.get("pages", [triage.get("extracted_data", {})])
-            pages     = stitch_multipage_tables(pages)
-            final_data = {"pages": pages, "_pipeline": "fast_track_cpu"}
+        # ── Smart Triage path ────────────────────────────────────────────
+        if orchestrator is not None:
+            routing_result = orchestrator.route_document(file_path, job_id)
+            final_data     = ast_compiler.compile(routing_result, source_filename)
+            exec_val       = routing_result.get("execution_path", ExecutionPath.PATH_2_HIGH_COMPLEXITY)
+            exec_path      = exec_val.value if hasattr(exec_val, "value") else exec_val
+            pcs_score      = routing_result.get("pcs_score", 0.0)
 
-        elif routing == "forward_to_vlm":
-            cleaned_path = triage.get("cleaned_file_path", file_path)
-            ai_resp = requests.post(
-                f"{LEGO3_URL}/extract",
-                json={"image_path": cleaned_path},
-                timeout=180,
-            )
-            ai_resp.raise_for_status()
-            ai_data = ai_resp.json()
-            page_data = ai_data.get("data", {})
+            # Crop visual assets from VLM grounding coordinates
+            if exec_path == "PATH_2":
+                pages     = routing_result.get("pages", [])
+                page0     = pages[0] if pages else {}
+                grounding = page0.pop("visual_grounding", []) or []
+                if grounding:
+                    asset_paths = crop_visual_assets(file_path, grounding, job_id)
+                    final_data["_asset_paths"] = asset_paths
 
-            # Visual grounding → crop assets
-            grounding = page_data.pop("visual_grounding", [])
-            asset_paths = crop_visual_assets(cleaned_path, grounding, job_id)
-
-            final_data = {
-                "pages"        : [page_data],
-                "_pipeline"    : "groq_vision",
-                "_model_used"  : ai_data.get("model_used", ""),
-                "_asset_paths" : asset_paths,
-            }
+            pipeline_name = routing_result.get("_pipeline", exec_path.lower())
 
         else:
-            raise ValueError(f"Unknown routing: {routing}")
+            # ── Legacy fallback: Lego 2 → Lego 3 HTTP chain ─────────────
+            logger.warning("[%s] Smart Triage not available — using legacy pipeline", job_id)
+            with open(file_path, "rb") as fh:
+                triage_resp = requests.post(
+                    f"{LEGO2_URL}/triage",
+                    files={"file": (source_filename, fh)},
+                    timeout=90,
+                )
+            triage_resp.raise_for_status()
+            triage  = triage_resp.json()
+            routing = triage.get("routing")
 
-        # ── Step 3: Persist enriched JSON ─────────────────────────────
-        final_data["_job_id"]    = job_id
-        final_data["_filename"]  = source_filename
-        final_data["_timestamp"] = datetime.utcnow().isoformat() + "Z"
+            if routing == "fast_track_complete":
+                pages     = triage.get("pages", [triage.get("extracted_data", {})])
+                pages     = stitch_multipage_tables(pages)
+                final_data = {"pages": pages, "_pipeline": "fast_track_cpu_legacy"}
+            elif routing == "forward_to_vlm":
+                cleaned_path = triage.get("cleaned_file_path", file_path)
+                ai_resp = requests.post(
+                    f"{LEGO3_URL}/extract",
+                    json={"image_path": cleaned_path},
+                    timeout=180,
+                )
+                ai_resp.raise_for_status()
+                ai_data   = ai_resp.json()
+                page_data = ai_data.get("data", {})
+                grounding = page_data.pop("visual_grounding", [])
+                asset_paths = crop_visual_assets(cleaned_path, grounding, job_id)
+                final_data = {
+                    "pages"       : [page_data],
+                    "_pipeline"   : "groq_vision_legacy",
+                    "_model_used" : ai_data.get("model_used", ""),
+                    "_asset_paths": asset_paths,
+                }
+            else:
+                raise ValueError(f"Unknown routing: {routing}")
 
+            pcs_score     = 0.0
+            pipeline_name = final_data.get("_pipeline", "legacy")
+            final_data["_job_id"]    = job_id
+            final_data["_filename"]  = source_filename
+            final_data["_timestamp"] = datetime.utcnow().isoformat() + "Z"
+
+        # ── Persist AST JSON to pending_review/ ──────────────────────────
         out_path = os.path.join(PENDING_DIR, f"{job_id}.json")
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(final_data, f, indent=4, ensure_ascii=False)
 
         job_registry[job_id] = {
             "status"   : "pending_review",
-            "pipeline" : final_data.get("_pipeline"),
+            "pipeline" : pipeline_name,
+            "pcs_score": pcs_score,
             "filename" : source_filename,
         }
-        logger.info("[%s] ✅ Written to pending_review", job_id)
+        logger.info("[%s] ✅ Smart Triage complete → pending_review (pipeline=%s, PCS=%.4f)",
+                    job_id, pipeline_name, pcs_score)
 
     except Exception as exc:
         logger.error("[%s] ❌ Pipeline error: %s", job_id, exc, exc_info=True)
