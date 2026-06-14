@@ -1,6 +1,6 @@
-# 🌿 Greencare AI — VLM-Powered Intelligent Document Processing
+# 🌿 Greencare AI — Local VLM-Powered Intelligent Document Processing
 
-A production-ready, four-microservice IDP pipeline that uses **VLM's Llama-3.2 Vision** to extract structured JSON from any document (PDFs, scanned images, handwritten forms) at blazing speed — no local GPU required.
+A production-ready, four-microservice IDP pipeline that uses a **local Qwen 2.5/3 30B model** to extract structured JSON from any document (PDFs, scanned images, handwritten forms) with full data privacy and offline capability.
 
 ---
 
@@ -34,7 +34,7 @@ A production-ready, four-microservice IDP pipeline that uses **VLM's Llama-3.2 V
 ┌──────────────────────────────────────────────────────────────────┐
 │  LEGO 3 — VLM Vision Engine  (port 8002)                        │
 │  • Base64 image encoding                                         │
-│  • llama-3.2-90b-vision-preview @ temperature=0.0               │
+│  • Qwen 2.5/3 30B local model @ temperature=0.0                 │
 │  • response_format=json_object (grammar-locked)                  │
 │  • Retry + exponential back-off on rate limits                   │
 └──────────────────────────────┬───────────────────────────────────┘
@@ -55,24 +55,24 @@ A production-ready, four-microservice IDP pipeline that uses **VLM's Llama-3.2 V
 
 ### Prerequisites
 - [Docker Desktop](https://www.docker.com/products/docker-desktop/)
-- A [VLM API key](https://console.vlm.com/keys) (free tier available)
+- Local inference server running **Qwen 2.5/3 30B** (e.g., Ollama or vLLM)
 
 ### 1. Clone / navigate to the project
 ```bash
 cd greencare-ai
 ```
 
-### 2. Set your API key
+### 2. Configure Local Model Endpoint
 ```bash
 # Windows PowerShell
 Copy-Item .env.example .env
-# Then open .env in a text editor and paste your VLM_API_KEY
+# Then open .env in a text editor and set your local inference URL (e.g., http://localhost:11434)
 ```
 
 ```bash
 # Linux / macOS
 cp .env.example .env
-nano .env   # paste VLM_API_KEY=gsk_...
+nano .env   # Configure local endpoint
 ```
 
 ### 3. Build and start all services
@@ -114,7 +114,7 @@ uvicorn lego2_triage.triage_service:app --port 8001 --reload
 
 **Terminal 2 — Lego 3 (VLM Engine)**
 ```bash
-set VLM_API_KEY=gsk_your_key_here   # Windows
+set LOCAL_VLM_URL=http://localhost:11434   # Windows
 uvicorn lego3_vlm.vlm_engine:app --port 8002 --reload
 ```
 
@@ -191,14 +191,14 @@ Every document processed through VLM returns:
 
 | Decision | Rationale |
 |---|---|
-| VLM API over local Qwen | 200x faster inference, zero GPU cost, no TensorRT compilation |
+| Local Qwen 2.5/3 30B over Cloud APIs | Full data privacy, offline capability, zero recurring API costs |
 | `response_format=json_object` | Grammar-level enforcement prevents hallucinated JSON formats |
 | `temperature=0.0` | Deterministic extraction; identical docs produce identical outputs |
-| CPU triage first | Saves VLM tokens for digital PDFs; ~60% of enterprise docs are digital |
+| CPU triage first | Bypasses the VLM for digital PDFs; ~60% of enterprise docs are digital |
 | OpenCV deskew + CLAHE | Better image quality → fewer VLM errors and lower confidence warnings |
 | HITL before database write | Human review catches the ~5-10% edge cases where VLMs err |
 
-> ⚠️ **Data Privacy Note:** This architecture sends document content to VLM's cloud API. For documents containing PII or PHI, ensure your use complies with VLM's [Terms of Service](https://vlm.com/terms-of-use/) and applicable privacy regulations (GDPR, HIPAA).
+> 🔒 **Data Privacy:** This architecture uses a local Qwen 30B model. All document content remains strictly on-premise, making it naturally compliant with strict privacy regulations (GDPR, HIPAA) for PII and PHI.
 
 ---
 
@@ -220,7 +220,7 @@ greencare-ai/
 │   └── triage_service.py       # CPU fast-track + image enhancement (port 8001)
 │
 ├── lego3_vlm/
-│   └── vlm_engine.py          # VLM Llama-3.2 Vision extraction (port 8002)
+│   └── vlm_engine.py          # Local Qwen 2.5/3 30B extraction (port 8002)
 │
 └── lego4_hitl/
     └── hitl_ui.py              # Gradio HITL dashboard (port 7860)
