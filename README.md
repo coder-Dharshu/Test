@@ -1,6 +1,6 @@
-# 🌿 Greencare AI — Groq-Powered Intelligent Document Processing
+# 🌿 Greencare AI — VLM-Powered Intelligent Document Processing
 
-A production-ready, four-microservice IDP pipeline that uses **Groq's Llama-3.2 Vision** to extract structured JSON from any document (PDFs, scanned images, handwritten forms) at blazing speed — no local GPU required.
+A production-ready, four-microservice IDP pipeline that uses **VLM's Llama-3.2 Vision** to extract structured JSON from any document (PDFs, scanned images, handwritten forms) at blazing speed — no local GPU required.
 
 ---
 
@@ -23,7 +23,7 @@ A production-ready, four-microservice IDP pipeline that uses **Groq's Llama-3.2 
 ┌──────────────────────────────────────────────────────────────────┐
 │  LEGO 2 — CPU Triage  (port 8001)                                │
 │  ┌─────────────────┐         ┌──────────────────────────────┐   │
-│  │  Digital PDF    │──Text──▶│  Fast-Track (no Groq token)  │   │
+│  │  Digital PDF    │──Text──▶│  Fast-Track (no VLM token)  │   │
 │  └─────────────────┘         └──────────────────────────────┘   │
 │  ┌─────────────────┐                                            │
 │  │  Image / Scanned│──Deskew + Glare-Suppress ──────────────▶  │
@@ -32,7 +32,7 @@ A production-ready, four-microservice IDP pipeline that uses **Groq's Llama-3.2 
                                │  image forwarded
                                ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│  LEGO 3 — Groq Vision Engine  (port 8002)                        │
+│  LEGO 3 — VLM Vision Engine  (port 8002)                        │
 │  • Base64 image encoding                                         │
 │  • llama-3.2-90b-vision-preview @ temperature=0.0               │
 │  • response_format=json_object (grammar-locked)                  │
@@ -55,7 +55,7 @@ A production-ready, four-microservice IDP pipeline that uses **Groq's Llama-3.2 
 
 ### Prerequisites
 - [Docker Desktop](https://www.docker.com/products/docker-desktop/)
-- A [Groq API key](https://console.groq.com/keys) (free tier available)
+- A [VLM API key](https://console.vlm.com/keys) (free tier available)
 
 ### 1. Clone / navigate to the project
 ```bash
@@ -66,13 +66,13 @@ cd greencare-ai
 ```bash
 # Windows PowerShell
 Copy-Item .env.example .env
-# Then open .env in a text editor and paste your GROQ_API_KEY
+# Then open .env in a text editor and paste your VLM_API_KEY
 ```
 
 ```bash
 # Linux / macOS
 cp .env.example .env
-nano .env   # paste GROQ_API_KEY=gsk_...
+nano .env   # paste VLM_API_KEY=gsk_...
 ```
 
 ### 3. Build and start all services
@@ -88,7 +88,7 @@ First build takes ~3-5 minutes (downloading Python image + deps). Subsequent sta
 |---|---|
 | 🚪 API Gateway (Swagger UI) | http://localhost:8000/docs |
 | 🔍 CPU Triage (Swagger UI) | http://localhost:8001/docs |
-| 🤖 Groq Vision (Swagger UI) | http://localhost:8002/docs |
+| 🤖 VLM Vision (Swagger UI) | http://localhost:8002/docs |
 | 👁 HITL Dashboard | http://localhost:7860 |
 
 ---
@@ -112,10 +112,10 @@ Open four terminals and run:
 uvicorn lego2_triage.triage_service:app --port 8001 --reload
 ```
 
-**Terminal 2 — Lego 3 (Groq Engine)**
+**Terminal 2 — Lego 3 (VLM Engine)**
 ```bash
-set GROQ_API_KEY=gsk_your_key_here   # Windows
-uvicorn lego3_groq.groq_engine:app --port 8002 --reload
+set VLM_API_KEY=gsk_your_key_here   # Windows
+uvicorn lego3_vlm.vlm_engine:app --port 8002 --reload
 ```
 
 **Terminal 3 — Celery Worker**
@@ -134,13 +134,13 @@ python lego4_hitl/hitl_ui.py
 
 ## Testing the Pipeline
 
-### Submit a digital PDF (fast-track, no Groq token used)
+### Submit a digital PDF (fast-track, no VLM token used)
 ```bash
 curl -X POST http://localhost:8000/api/v1/ingest \
   -F "file=@/path/to/your/document.pdf"
 ```
 
-### Submit a photo/scan (will call Groq)
+### Submit a photo/scan (will call VLM)
 ```bash
 curl -X POST http://localhost:8000/api/v1/ingest \
   -F "file=@/path/to/scanned_form.jpg"
@@ -158,7 +158,7 @@ Navigate to **http://localhost:7860**, click **Refresh Queue**, then navigate th
 
 ## Extracted JSON Schema
 
-Every document processed through Groq returns:
+Every document processed through VLM returns:
 
 ```json
 {
@@ -180,7 +180,7 @@ Every document processed through Groq returns:
   "handwriting_detected": false,
   "confidence_warning": false,
   "confidence_warning_reason": null,
-  "_pipeline": "groq_vision",
+  "_pipeline": "vlm_vision",
   "_job_id": "uuid-here"
 }
 ```
@@ -191,14 +191,14 @@ Every document processed through Groq returns:
 
 | Decision | Rationale |
 |---|---|
-| Groq API over local Qwen | 200x faster inference, zero GPU cost, no TensorRT compilation |
+| VLM API over local Qwen | 200x faster inference, zero GPU cost, no TensorRT compilation |
 | `response_format=json_object` | Grammar-level enforcement prevents hallucinated JSON formats |
 | `temperature=0.0` | Deterministic extraction; identical docs produce identical outputs |
-| CPU triage first | Saves Groq tokens for digital PDFs; ~60% of enterprise docs are digital |
+| CPU triage first | Saves VLM tokens for digital PDFs; ~60% of enterprise docs are digital |
 | OpenCV deskew + CLAHE | Better image quality → fewer VLM errors and lower confidence warnings |
 | HITL before database write | Human review catches the ~5-10% edge cases where VLMs err |
 
-> ⚠️ **Data Privacy Note:** This architecture sends document content to Groq's cloud API. For documents containing PII or PHI, ensure your use complies with Groq's [Terms of Service](https://groq.com/terms-of-use/) and applicable privacy regulations (GDPR, HIPAA).
+> ⚠️ **Data Privacy Note:** This architecture sends document content to VLM's cloud API. For documents containing PII or PHI, ensure your use complies with VLM's [Terms of Service](https://vlm.com/terms-of-use/) and applicable privacy regulations (GDPR, HIPAA).
 
 ---
 
@@ -219,8 +219,8 @@ greencare-ai/
 ├── lego2_triage/
 │   └── triage_service.py       # CPU fast-track + image enhancement (port 8001)
 │
-├── lego3_groq/
-│   └── groq_engine.py          # Groq Llama-3.2 Vision extraction (port 8002)
+├── lego3_vlm/
+│   └── vlm_engine.py          # VLM Llama-3.2 Vision extraction (port 8002)
 │
 └── lego4_hitl/
     └── hitl_ui.py              # Gradio HITL dashboard (port 7860)
