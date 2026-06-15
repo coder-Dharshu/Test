@@ -120,6 +120,49 @@ Rules:
 - For curved or rotated text (package labels, bottles): transcribe the text as if unwarped.
 """
 
+# ---------------------------------------------------------------------------
+# Image Router Prompt
+# ---------------------------------------------------------------------------
+ROUTER_SYSTEM_PROMPT = """
+You are an image processing system.
+
+1. Detect whether the image contains readable text.
+
+2. If the image is primarily a text document:
+   * Extract all text using OCR.
+   * Return the extracted text.
+
+3. If the image is a general image (photo, illustration, infographic, diagram, poster, chart, artwork, educational image, etc.):
+   * Return the original image unchanged.
+   * If readable text exists in the image, also extract and return the detected text.
+
+Output format:
+
+For text documents:
+{
+"type": "text_document",
+"text": "<extracted_text>"
+}
+
+For general images with text:
+{
+"type": "general_image",
+"image": "<original_image>",
+"detected_text": "<extracted_text>"
+}
+
+For general images without text:
+{
+"type": "general_image",
+"image": "<original_image>"
+}
+
+Important:
+* The presence of text should not prevent the original image from being returned.
+* OCR and image return are not mutually exclusive.
+* For general images, always preserve and return the original image.
+"""
+
 
 # ---------------------------------------------------------------------------
 # Models
@@ -203,6 +246,61 @@ def call_groq(b64_image: str, mime: str, retries: int = 3) -> dict:
             time.sleep(2)
 
 
+def call_groq_router(b64_image: str, mime: str, image_path: str, retries: int = 3) -> dict:
+    """
+    Calls Groq with the image router prompt to determine if an image
+    is a TEXT_DOCUMENT or a GENERAL_IMAGE.
+    """
+    for attempt in range(1, retries + 1):
+        try:
+            logger.info("Groq router call attempt %d/%d", attempt, retries)
+            completion = client.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "Classify this image and follow the processing rules. Return JSON.",
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:{mime};base64,{b64_image}"},
+                            },
+                        ],
+                    },
+                ],
+                model=GROQ_MODEL,
+                temperature=0.0,
+                max_tokens=MAX_TOKENS,
+                response_format={"type": "json_object"},
+            )
+
+            raw = completion.choices[0].message.content
+            logger.info("Groq router response: %d chars", len(raw))
+            result = json.loads(raw)
+            
+            # Inject the original image path if it's a general image
+            if result.get("type") == "general_image":
+                result["image"] = image_path
+                
+            return result
+
+        except RateLimitError as exc:
+            wait = 2 ** attempt
+            logger.warning("Rate limit — waiting %ds. %s", wait, exc)
+            time.sleep(wait)
+            if attempt == retries:
+                raise HTTPException(status_code=429, detail=f"Groq rate limit: {exc}")
+
+        except (APIError, json.JSONDecodeError, Exception) as exc:
+            logger.error("Groq router error on attempt %d: %s", attempt, exc)
+            if attempt == retries:
+                raise HTTPException(status_code=502, detail=f"Groq API error: {exc}")
+            time.sleep(2)
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -228,6 +326,27 @@ def extract(payload: ImagePayload):
         raise HTTPException(status_code=404, detail=str(exc))
 
     result = call_groq(b64, mime)
+
+    return ExtractionResponse(
+        status    ="success",
+        model_used=GROQ_MODEL,
+        data      =result,
+    )
+
+
+@app.post("/route", tags=["Routing"], response_model=ExtractionResponse)
+def route_image(payload: ImagePayload):
+    """
+    Image Routing System: classifies as text or general image,
+    and performs OCR if text.
+    """
+    logger.info("Router request: %s", payload.image_path)
+    try:
+        b64, mime = encode_image(payload.image_path)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    result = call_groq_router(b64, mime, payload.image_path)
 
     return ExtractionResponse(
         status    ="success",

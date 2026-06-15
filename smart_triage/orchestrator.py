@@ -7,9 +7,9 @@ Dynamic Routing (Local-First, Confidence-Gated):
   Track A  — Vector-native PDF     → Programmatic pypdf extraction (zero API cost)
   Track B  — Raster / Scanned     → Always try CPU OCR locally first
     Path 1   (OCR confidence >= 80%) → Accept local result (zero API cost)
-    Path 2   (OCR confidence <  80%) → Escalate to Groq Vision LLM as fallback
+    Path 2   (OCR confidence <  80%) → Escalate to VLM as fallback
 
-The Groq API is a LAST RESORT only — called when local extraction quality
+The VLM API is a LAST RESORT only — called when local extraction quality
 is below the confidence threshold (default 80%). The PCS score is still
 calculated for display/audit purposes in the HITL dashboard.
 
@@ -101,8 +101,21 @@ MIN_TEXT_CHARS = 50
 
 # Local-first confidence gate:
 # If CPU OCR average confidence is >= this value, accept local result (no API call).
-# If confidence is BELOW this value, escalate to Groq Vision LLM.
+# If confidence is BELOW this value, escalate to VLM.
 OCR_CONFIDENCE_THRESHOLD = 80.0  # percent (0–100)
+
+# ---------------------------------------------------------------------------
+# Image Router — Classification Thresholds
+# ---------------------------------------------------------------------------
+# An uploaded image is classified as a "text_document" when its computed
+# text-density score exceeds this threshold; otherwise it is treated as a
+# "general_photo" and returned unchanged (no OCR, no VLM).
+#
+# Score is a blend of:
+#   • Morphological horizontal-text-line coverage  (weight 0.50)
+#   • Canny edge density normalised by image area   (weight 0.25)
+#   • Contour count proxy for character density     (weight 0.25)
+IMAGE_ROUTER_TEXT_THRESHOLD = float(os.environ.get("IMAGE_ROUTER_TEXT_THRESHOLD", "0.12"))
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +136,8 @@ class SmartTriageOrchestrator:
     ):
         self.pcs_threshold            = pcs_threshold
         self.ocr_confidence_threshold = ocr_confidence_threshold
-        self.lego3_url                = lego3_url
+        self.lego3_url = os.environ.get("LEGO3_VLM_URL", "http://localhost:8002/api/v1")
+        self.easyocr_reader = None
         self.lego2_temp_dir           = lego2_temp_dir
         os.makedirs(lego2_temp_dir, exist_ok=True)
         
@@ -138,8 +152,8 @@ class SmartTriageOrchestrator:
             self.img2table_ocr_wrapper = None
 
         logger.info(
-            "SmartTriageOrchestrator ready | OCR confidence gate=%.0f%% | pdfium=%s | paddle=%s",
-            ocr_confidence_threshold, PDFIUM_AVAILABLE, PADDLE_AVAILABLE,
+            "SmartTriageOrchestrator ready | OCR confidence gate=%.0f%% | pdfium=%s | paddle=%s | img_router_threshold=%.2f",
+            ocr_confidence_threshold, PDFIUM_AVAILABLE, PADDLE_AVAILABLE, IMAGE_ROUTER_TEXT_THRESHOLD,
         )
 
     # ── Track A: Multi-Engine Digital PDF Detection ───────────────────────────
@@ -303,7 +317,7 @@ class SmartTriageOrchestrator:
         total_chars = sum(len(p["extracted_text"].strip()) for p in existing_pages)
         return existing_pages, total_chars
 
-    def is_vector_native(self, pdf_path: str) -> tuple[bool, list[dict]]:
+    def is_vector_native(self, pdf_path: str, job_id: str) -> tuple[bool, list[dict]]:
         """
         Multi-engine cascaded digital PDF detection.
 
@@ -316,7 +330,7 @@ class SmartTriageOrchestrator:
           A. total_extractable_chars >= MIN_TEXT_CHARS  (default 50)
           B. printable_char_ratio    >= MIN_PRINTABLE_RATIO  (default 0.85)
 
-          → DIGITAL PDF : skip OCR entirely, skip Groq entirely
+          → DIGITAL PDF : skip OCR entirely, skip VLM entirely
           → SCANNED PDF : route to Track B (OCR pipeline)
 
         The printable-ratio gate catches PDFs that embed stray font-cmap
@@ -333,17 +347,7 @@ class SmartTriageOrchestrator:
 
         is_native = (total_chars >= self.MIN_TEXT_CHARS) and (print_ratio >= self.MIN_PRINTABLE_RATIO)
 
-        pages_out = [{
-            "page_number"              : 1,
-            "extracted_text"           : all_text,
-            "coordinates"              : [],
-            "tables"                   : plumber_data.get("tables", []),
-            "key_value_pairs"          : {},
-            "handwriting_detected"     : False,
-            "confidence_warning"       : False,
-            "confidence_warning_reason": None,
-            "_engine"                  : "pdfplumber",
-        }]
+        pages_out = []
 
         logger.info(
             "Track A decision: %s | chars=%d (gate≥%d: %s) | printable=%.2f%% (gate≥%.0f%%: %s) | engines=['pdfplumber']",
@@ -356,21 +360,81 @@ class SmartTriageOrchestrator:
 
         # If it's a digital PDF, structure specific formats locally using Regex
         if is_native:
-            for p in pages_out:
-                text = p.get("extracted_text", "")
-                
-                # NPTEL Certificate Local Parser
-                if "NPTEL" in text:
-                    p["key_value_pairs"] = {}
+            # ── Native Extraction via PyMuPDF ─────────────────────────
+            try:
+                import fitz
+                import uuid
+                doc = fitz.open(pdf_path)
+                for i in range(len(doc)):
+                    page = doc[i]
+                    page_text = page.get_text("text") or ""
+                    images_out = []
                     
-                    name = re.search(r'awarded to\s+([A-Za-z\s]+?)\s+for successfully', text, re.IGNORECASE)
-                    if name: p["key_value_pairs"]["Candidate Name"] = name.group(1).strip()
+                    image_list = page.get_images(full=True)
+                    if image_list:
+                        for img_idx, img in enumerate(image_list):
+                            xref = img[0]
+                            base_image = doc.extract_image(xref)
+                            if not base_image: continue
+                            image_bytes = base_image["image"]
+                            image_ext = base_image["ext"]
+                            w = base_image["width"]
+                            h = base_image["height"]
+                            img_filename = f"{job_id}_p{i+1}_img{img_idx}_{str(uuid.uuid4())[:4]}.{image_ext}"
+                            img_path = os.path.join(self.lego2_temp_dir, img_filename)
+                            with open(img_path, "wb") as f:
+                                f.write(image_bytes)
+                            images_out.append({
+                                "image_id": f"img_{xref}",
+                                "filename": img_filename,
+                                "path": img_path,
+                                "width": w,
+                                "height": h
+                            })
+                    else:
+                        # Fallback: check if page contains vector graphics
+                        drawings = page.get_drawings()
+                        if drawings:
+                            pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
+                            img_filename = f"{job_id}_p{i+1}_preview_{str(uuid.uuid4())[:4]}.png"
+                            img_path = os.path.join(self.lego2_temp_dir, img_filename)
+                            pix.save(img_path)
+                            images_out.append({
+                                "image_id": f"preview_p{i+1}",
+                                "filename": img_filename,
+                                "path": img_path,
+                                "width": pix.w,
+                                "height": pix.h
+                            })
+                            
+                    # Local regex parsing
+                    kv_pairs = {}
+                    if "NPTEL" in page_text:
+                        name = re.search(r'awarded to\s+([A-Za-z\s]+?)\s+for successfully', page_text, re.IGNORECASE)
+                        if name: kv_pairs["Candidate Name"] = name.group(1).strip()
+                        score = re.search(r'score of\s+(\d+)', page_text, re.IGNORECASE)
+                        if score: kv_pairs["Final Score"] = score.group(1).strip()
+                        roll = re.search(r'Roll No:\s*([A-Z0-9]+)', page_text, re.IGNORECASE)
+                        if roll: kv_pairs["Roll Number"] = roll.group(1).strip()
+
+                    # Add page
+                    pages_out.append({
+                        "page_number": i + 1,
+                        "extracted_text": page_text,
+                        "coordinates": [],
+                        "tables": plumber_data.get("tables", []) if i == 0 else [], # tables aggregated in p1 for now
+                        "key_value_pairs": kv_pairs,
+                        "handwriting_detected": False,
+                        "confidence_warning": False,
+                        "confidence_warning_reason": None,
+                        "_engine": "pymupdf",
+                        "images": images_out
+                    })
                     
-                    score = re.search(r'score of\s+(\d+)', text, re.IGNORECASE)
-                    if score: p["key_value_pairs"]["Final Score"] = score.group(1).strip()
+                    logger.info("[%s] PyMuPDF Page %d: extracted %d chars, %d images", job_id, i+1, len(page_text), len(images_out))
                     
-                    roll = re.search(r'Roll No:\s*([A-Z0-9]+)', text, re.IGNORECASE)
-                    if roll: p["key_value_pairs"]["Roll Number"] = roll.group(1).strip()
+            except Exception as exc:
+                logger.warning("[%s] Failed to extract native PDF pages via PyMuPDF: %s", job_id, exc)
 
         return is_native, pages_out
 
@@ -518,6 +582,27 @@ class SmartTriageOrchestrator:
 
         return pages_out
 
+
+    # ── VLM Image Router — text_document vs general_photo ───────────────────
+
+    def classify_and_route_image(self, file_path: str) -> dict:
+        """
+        Calls the Lego 3 Groq VLM router endpoint to determine if the image
+        is a TEXT_DOCUMENT or GENERAL_IMAGE using semantic understanding.
+        """
+        try:
+            resp = requests.post(
+                f"{self.lego3_url}/route",
+                json={"image_path": file_path},
+                timeout=180,
+            )
+            resp.raise_for_status()
+            # The VLM returns {"type": "text_document"|"general_image", "text"|"image": "...", "detected_text"?: "..."}
+            return resp.json().get("data", {"type": "general_image", "image": file_path})
+        except Exception as exc:
+            logger.error("VLM Router call failed: %s", exc)
+            # Safe fallback: treat as image so we don't drop user data
+            return {"type": "general_image", "image": file_path}
 
     # ── OpenCV Complexity Sieve ───────────────────────────────────────────────
 
@@ -767,10 +852,10 @@ class SmartTriageOrchestrator:
         
         if avg_conf < self.ocr_confidence_threshold:
             confidence_warning = True
-            reason = f"Local OCR confidence {avg_conf:.1f}% < {self.ocr_confidence_threshold:.0f}% threshold — escalated to Groq VLM"
+            reason = f"Local OCR confidence {avg_conf:.1f}% < {self.ocr_confidence_threshold:.0f}% threshold — escalated to VLM"
         elif word_count < 3:
             confidence_warning = True
-            reason = f"OCR returned only {word_count} words (< 3) — escalated to Groq VLM"
+            reason = f"OCR returned only {word_count} words (< 3) — escalated to VLM"
 
         logger.info(
             "Path 1 OCR complete | words=%d | avg_confidence=%.1f%% | threshold=%.0f%%",
@@ -789,11 +874,11 @@ class SmartTriageOrchestrator:
             "_ocr_word_count"            : word_count,
         }
 
-    # ── Path 2: VLM (Groq Vision) ─────────────────────────────────────────────
+    # ── Path 2: VLM ─────────────────────────────────────────────
 
     def run_path_2_vlm(self, image_bgr: np.ndarray, temp_path: str) -> dict[str, Any]:
         """
-        Path 2 — High-Complexity VLM via Groq Vision Engine (lego3 on port 8002).
+        Path 2 — High-Complexity VLM Engine (lego3 on port 8002).
         Saves the preprocessed image to disk and calls the existing /extract endpoint.
         """
         # Save cleaned image to temp file for lego3 to read
@@ -812,7 +897,7 @@ class SmartTriageOrchestrator:
             result = resp.json()
             return result.get("data", {})
         except Exception as exc:
-            logger.error("Groq VLM call failed: %s", exc)
+            logger.error("VLM call failed: %s", exc)
             return {
                 "extracted_text"    : "",
                 "key_value_pairs"   : {},
@@ -883,7 +968,7 @@ class SmartTriageOrchestrator:
 
         # ── TRACK A: Digital PDF ─────────────────────────────────────────
         if ext == ".pdf":
-            is_native, pages_data = self.is_vector_native(file_path)
+            is_native, pages_data = self.is_vector_native(file_path, job_id)
             if is_native:
                 logger.info("[%s] → Track A: Digital Fast-Path (%d pages)", job_id, len(pages_data))
                 return {
@@ -988,7 +1073,90 @@ class SmartTriageOrchestrator:
                 "pages"         : [],
                 "_pipeline"     : "error_unreadable",
             }
-        return self._run_track_b(image_bgr, file_path, job_id)
+
+        # ── IMAGE ROUTER — VLM Classification ────────────
+        classification = self.classify_and_route_image(file_path)
+        route_type = classification.get("type", "general_image")
+        
+        logger.info(
+            "[%s] VLM Image classification → type=%s",
+            job_id, route_type,
+        )
+
+        if route_type == "general_image":
+            # General photo: VLM decided it's mostly visual content.
+            # It may also contain 'detected_text'.
+            logger.info(
+                "[%s] → General Photo detected — returning image unchanged",
+                job_id,
+            )
+            detected_text = classification.get("detected_text", "")
+            
+            if not detected_text.strip():
+                logger.info("[%s] VLM returned no text. Using local OCR library (EasyOCR) to extract incidental text...", job_id)
+                try:
+                    import easyocr
+                    if self.easyocr_reader is None:
+                        # Lazy initialization of EasyOCR to save startup time
+                        self.easyocr_reader = easyocr.Reader(['en'], gpu=False)
+                    res = self.easyocr_reader.readtext(file_path, detail=0)
+                    if res:
+                        detected_text = " ".join(res)
+                        logger.info("[%s] Local EasyOCR extracted %d characters from general image.", job_id, len(detected_text))
+                except Exception as e:
+                    logger.warning("Local EasyOCR fallback failed: %s", e)
+
+            return {
+                "job_id"          : job_id,
+                "execution_path"  : "GENERAL_PHOTO",
+                "pcs_score"       : 0.0,
+                "pcs_breakdown"   : None,
+                "image_type"      : "general_image",
+                "image_path"      : file_path,
+                "classification"  : {"image_type": "general_image", "text_score": 0.0, "signals": {}},
+                "pages"           : [{
+                    "page_number"               : 1,
+                    "image_type"                : "general_image",
+                    "image_path"                : file_path,
+                    "_source_image"             : file_path,
+                    "extracted_text"            : detected_text,
+                    "key_value_pairs"           : {},
+                    "tables"                    : [],
+                    "coordinates"               : [],
+                    "handwriting_detected"      : False,
+                    "confidence_warning"        : False,
+                    "confidence_warning_reason" : None,
+                    "elements"                  : [],
+                    "execution_path"            : "GENERAL_PHOTO",
+                }],
+                "_pipeline"       : "general_photo",
+                "_response_type"  : "general_image",
+            }
+
+        # text_document — The VLM already performed OCR per the routing prompt!
+        logger.info("[%s] → Text Document detected — using VLM extracted text", job_id)
+        extracted_text = classification.get("text", "")
+        
+        return {
+            "job_id"        : job_id,
+            "execution_path": ExecutionPath.PATH_2_HIGH_COMPLEXITY.value,
+            "pcs_score"     : 0.0,
+            "pcs_breakdown" : None,
+            "pages"         : [{
+                "page_number"              : 1,
+                "extracted_text"           : extracted_text,
+                "coordinates"             : [],
+                "tables"                   : [],
+                "key_value_pairs"          : {},
+                "handwriting_detected"     : False,
+                "confidence_warning"       : False,
+                "confidence_warning_reason": None,
+                "_source_image"            : file_path,
+                "_engine"                  : "vlm_router",
+            }],
+            "_pipeline"     : "path_2_groq_vlm",
+            "_response_type": "text",
+        }
 
     def _run_track_b(self, image_bgr: np.ndarray, file_path: str, job_id: str) -> dict[str, Any]:
         """
@@ -999,7 +1167,7 @@ class SmartTriageOrchestrator:
           Step 3: ALWAYS attempt CPU OCR first (pytesseract)
           Step 4: Check OCR confidence:
                    >= OCR_CONFIDENCE_THRESHOLD → Accept local result (Path 1, zero API cost)
-                   <  OCR_CONFIDENCE_THRESHOLD → Escalate to Groq Vision LLM (Path 2, fallback)
+                   <  OCR_CONFIDENCE_THRESHOLD → Escalate to VLM (Path 2, fallback)
         """
         # Step 1: Pre-process the image
         cleaned_bgr, downscaled_bgr = self.preprocess_image(image_bgr)
@@ -1055,14 +1223,14 @@ class SmartTriageOrchestrator:
                 "_pipeline"     : "path_1_cpu_ocr",
             }
         else:
-            # ── PATH 2: Escalate to Groq VLM ────────────────────────────
+            # ── PATH 2: Escalate to VLM ────────────────────────────
             reason = (
                 f"PaddleOCR not installed"
                 if no_ocr
                 else f"Local OCR confidence {ocr_conf:.1f}% < {current_threshold:.1f}% threshold"
             )
             logger.info(
-                "[%s] → Path 2 ESCALATION: %s — calling Groq Vision LLM",
+                "[%s] → Path 2 ESCALATION: %s — calling VLM",
                 job_id, reason,
             )
             vlm_result = self.run_path_2_vlm(cleaned_bgr, clean_path)

@@ -3,7 +3,7 @@ Greencare AI — Master Launcher (No Docker, No Redis Required)
 =============================================================
 Starts all 4 Lego services in separate background processes:
   Lego 2 → http://localhost:8001  (CPU Triage)
-  Lego 3 → http://localhost:8002  (Groq Vision Engine)
+  Lego 3 → http://localhost:8002  (VLM Vision Engine)
   Lego 1 → http://localhost:8000  (API Gateway + Serialization)
   Lego 4 → http://localhost:7860  (HITL Dashboard)
 
@@ -53,7 +53,7 @@ SERVICES = [
         "color"  : "\033[94m",
     },
     {
-        "name"   : "Lego3-Groq-Engine",
+        "name"   : "Lego3-VLM-Engine",
         "cmd"    : [PYTHON, "-m", "uvicorn", "lego3_groq.groq_engine:app",
                     "--host", "0.0.0.0", "--port", "8002"],
         "health" : "http://localhost:8002/health",
@@ -149,7 +149,7 @@ def main():
     print(f"{BOLD}[LIVE] Greencare AI — Smart Triage is running!{RESET}")
     print(f"  [1] API Gateway      --> http://localhost:8000/docs")
     print(f"  [2] CPU Triage       --> http://localhost:8001/docs")
-    print(f"  [3] Groq Engine      --> http://localhost:8002/docs")
+    print(f"  [3] VLM Engine       --> http://localhost:8002/docs")
     print(f"  [4] HITL Dashboard   --> http://localhost:8501  (Streamlit)")
     print(f"{BOLD}{'=' * 55}{RESET}")
     print("\nPress Ctrl+C to stop all services.\n")

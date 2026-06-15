@@ -51,12 +51,75 @@ class ASTCompiler:
         """
         Takes the full routing_result dict from SmartTriageOrchestrator.route_document()
         and produces a Docling-compliant AST document.
+
+        Special case — general_photo:
+          When the image router classifies the uploaded image as a general photo,
+          routing_result["_pipeline"] == "general_photo".  In this case we skip
+          all OCR / VLM compilation and embed the image path directly into the
+          AST so the gateway returns:
+            { "type": "general_image", "image": "<original_image_path>" }
         """
         job_id         = routing_result.get("job_id", str(uuid.uuid4()))
         pages_raw      = routing_result.get("pages", [])
         execution_path = routing_result.get("execution_path", "PATH_2")
         pcs_score      = routing_result.get("pcs_score", 0.0)
         pipeline       = routing_result.get("_pipeline", "unknown")
+
+        # ── General Photo short-circuit ───────────────────────────────────────
+        if pipeline == "general_photo":
+            image_path     = routing_result.get("image_path", "")
+            classification = routing_result.get("classification", {})
+            detected_text  = ""
+            if pages_raw and len(pages_raw) > 0:
+                detected_text = pages_raw[0].get("extracted_text", "")
+
+            logger.info(
+                "AST short-circuit: general_photo | %s | image=%s",
+                job_id, image_path,
+            )
+            return {
+                "document_metadata": {
+                    "doc_id"              : job_id,
+                    "source_filename"     : source_filename,
+                    "total_pages"         : 1,
+                    "processed_timestamp" : datetime.now(timezone.utc).isoformat(),
+                    "pipeline"            : pipeline,
+                    "execution_path"      : "GENERAL_PHOTO",
+                    "pcs_score"           : 0.0,
+                    "pcs_breakdown"       : None,
+                },
+                "pages": [{
+                    "page_index"               : 0,
+                    "page_number"              : 1,
+                    "execution_path"           : "GENERAL_PHOTO",
+                    "image_type"               : "general_image",
+                    "image_path"               : image_path,
+                    "_source_image"            : image_path,
+                    "pcs_score"                : 0.0,
+                    "document_type"            : "general_image",
+                    "language"                 : "n/a",
+                    "dimensions"               : {"width": 1000.0, "height": 1000.0},
+                    "elements"                 : [{"element_id": "text_0", "type": "text", "content": {"text": detected_text}}] if detected_text else [],
+                    "extracted_text"           : detected_text,
+                    "key_value_pairs"          : {},
+                    "tables"                   : [],
+                    "handwriting_detected"     : False,
+                    "confidence_warning"       : False,
+                    "confidence_warning_reason": None,
+                    "_ocr_avg_confidence"      : None,
+                    "classification"           : classification,
+                }],
+                # Response routing fields for the gateway
+                "_response_type" : "general_image",
+                "_image_path"    : image_path,
+                "_detected_text" : detected_text,
+                "_classification": classification,
+                # Legacy compat
+                "_job_id"   : job_id,
+                "_filename" : source_filename,
+                "_pipeline" : pipeline,
+                "_timestamp": datetime.now(timezone.utc).isoformat(),
+            }
 
         compiled_pages = []
         for idx, page_raw in enumerate(pages_raw):
@@ -155,13 +218,17 @@ class ASTCompiler:
         # ── Visual grounding → graphic elements ──
         grounding = page_raw.get("visual_grounding", []) or []
         for g_idx, g in enumerate(grounding):
-            box   = g.get("box_2d", [0, 0, 100, 100])
-            label = g.get("label", "graphic")
+            box              = g.get("box_2d", [0, 0, 100, 100])
+            label            = g.get("label", "graphic")
+            signature_result = g.get("signature_result")   # set by crop_visual_assets for signatures
+            content: dict = {"label": label}
+            if signature_result:
+                content["signature_result"] = signature_result
             elements.append({
                 "element_id": f"p{page_index}_g{g_idx}_{str(uuid.uuid4())[:6]}",
                 "type"      : "graphic",
                 "bbox"      : self._normalize_bbox(box, 1000, 1000),
-                "content"   : {"label": label},
+                "content"   : content,
             })
 
         # ── Confidence metadata ──
@@ -172,6 +239,9 @@ class ASTCompiler:
         document_type             = page_raw.get("document_type", "unknown")
         language                  = page_raw.get("language", "en")
 
+        images_out = page_raw.get("images", [])
+        logger.info(f"API returning {len(images_out)} images for page {page_index+1}")
+
         return {
             "page_index"   : page_index,
             "page_number"  : page_raw.get("page_number", page_index + 1),
@@ -181,6 +251,7 @@ class ASTCompiler:
             "language"     : language,
             "dimensions"   : {"width": 1000.0, "height": 1000.0},
             "elements"     : elements,
+            "images"       : images_out,
             # Raw extraction fields preserved for backward compat + HITL editing
             "extracted_text"             : raw_text,
             "markdown_tables"            : markdown_tables,
