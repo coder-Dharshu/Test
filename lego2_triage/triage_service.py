@@ -6,6 +6,7 @@ Responsibilities (per blueprint §3.2):
   • Inspects inbound files:
       - Digitally native PDF  → extract text + coordinate matrices via pypdf / pypdfium2
       - Scanned / photo       → apply glare suppression + deskew, forward to Groq (Lego 3)
+  • Binarization (Otsu threshold) applied before forwarding to VLM — strips color noise
   • Blueprint §5 Resiliency:
       - Specular Glare Suppression (adaptive threshold + TELEA inpaint + CLAHE)
       - Deskew correction (minAreaRect angle detection)
@@ -139,6 +140,32 @@ def deskew_image(image_path: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Binarization — convert to clean black-and-white before VLM forwarding
+# ---------------------------------------------------------------------------
+def binarize_image(image_path: str) -> str:
+    """
+    Converts the preprocessed image to a binary (black-and-white) image
+    using Otsu's global threshold on the grayscale channel.
+    Binarizing removes colour noise and gives the VLM cleaner text contrast
+    without wasting vision tokens on irrelevant hue/saturation information.
+    Returns the path to the saved binarized PNG.
+    """
+    image = cv2.imread(image_path)
+    if image is None:
+        logger.warning("Cannot read image for binarization: %s", image_path)
+        return image_path
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+
+    base, _ = os.path.splitext(image_path)
+    bin_path = f"{base}_binary.png"   # always save as lossless PNG
+    cv2.imwrite(bin_path, binary)
+    logger.info("Binarization complete (Otsu) → %s", bin_path)
+    return bin_path
+
+
+# ---------------------------------------------------------------------------
 # PDF extraction — native text + coordinate matrices
 # ---------------------------------------------------------------------------
 def extract_pdf_data(pdf_path: str) -> dict:
@@ -267,6 +294,7 @@ async def triage_document(file: UploadFile = File(...)):
     elif ext in IMAGE_EXT:
         processed = deskew_image(dest_path)
         processed = apply_glare_suppression(processed)
+        processed = binarize_image(processed)   # strip colour before VLM
         return {
             "routing"           : "forward_to_vlm",
             "cleaned_file_path" : processed,

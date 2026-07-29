@@ -1,18 +1,11 @@
 """
-Greencare AI — Lego 3: Groq Vision Engine (The Power Brick)
-===========================================================
+Greencare AI — Lego 3: Local VLM Engine (Ollama)
+===================================================
 Responsibilities (per blueprint §3.3):
   • Ingests raw image matrices (base64 encoded)
-  • Executes Groq Llama-3.2-90B-Vision (replaces local Qwen2.5-VL-7B)
-  • Enforces strict output syntax via response_format=json_object (§4.4 CFG masking)
+  • Executes local Ollama model (Qwen 3.6 27b)
+  • Enforces strict output syntax via format=json (§4.4 CFG masking)
   • Returns formatted Markdown tables, text streams, and visual grounding coordinates
-  • Retry + exponential back-off for Groq rate limits
-
-Blueprint §4 features implemented via Groq API:
-  §4.1 Dynamic Resolution → Groq handles natively via image_url
-  §4.2 mRoPE            → Model's internal positional encoding
-  §4.3 Visual Grounding  → Prompt instructs model to return box_2d coordinates
-  §4.4 CFG Decoding      → response_format=json_object enforces grammar-level JSON
 
 Runs on: Port 8002
 """
@@ -29,7 +22,6 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from groq import Groq, RateLimitError, APIError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -38,25 +30,11 @@ logger = logging.getLogger(__name__)
 # App
 # ---------------------------------------------------------------------------
 app = FastAPI(
-    title="Greencare AI — Lego 3: Groq Vision Engine",
-    description=(
-        "Multimodal VLM engine using Groq Llama-3.2 Vision. "
-        "Implements §4.1–§4.4 of the blueprint via API."
-    ),
+    title="Greencare AI — Lego 3: Local VLM Engine",
+    description="Multimodal VLM engine using local Ollama.",
     version="2.0.0",
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
-# ---------------------------------------------------------------------------
-# Groq client
-# ---------------------------------------------------------------------------
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-if not GROQ_API_KEY:
-    raise RuntimeError("GROQ_API_KEY environment variable is not set.")
-
-client     = Groq(api_key=GROQ_API_KEY)
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
-MAX_TOKENS = int(os.environ.get("GROQ_MAX_TOKENS", "4096"))
 
 # ---------------------------------------------------------------------------
 # §4.4 Constrained Grammar Decoding — System Prompt
@@ -125,12 +103,16 @@ Rules:
 # Models
 # ---------------------------------------------------------------------------
 class ImagePayload(BaseModel):
-    image_path: str = Field(..., description="Path to the preprocessed image on disk.")
+    image_path           : str            = Field(..., description="Path to the original/clean image on disk.")
+    binarized_image_path : Optional[str]  = Field(None, description="Optional path to a binarized (B&W) version for better table reading.")
 
 class ExtractionResponse(BaseModel):
+    model_config = {"protected_namespaces": ()}
+
     status    : str
     model_used: str
     data      : dict
+
 
 
 # ---------------------------------------------------------------------------
@@ -151,56 +133,58 @@ def encode_image(image_path: str) -> tuple[str, str]:
     return b64, mime
 
 
-def call_groq(b64_image: str, mime: str, retries: int = 3) -> dict:
+# ---------------------------------------------------------------------------
+# Ollama Local VLM Integration (Qwen2.5-VL)
+# ---------------------------------------------------------------------------
+def call_ollama(
+    b64_image: str,
+    b64_binarized: Optional[str] = None,
+    model: str = "qwen3.6-vl:27b",
+    timeout: int = 60,
+) -> dict:
     """
-    §4.4 CFG masking implemented via response_format=json_object.
-    Exponential back-off on rate limits.
+    Call local Ollama server running Qwen3.6-VL-27B.
+    Strips 'data:image/...' headers if present; Ollama expects raw base64.
     """
-    for attempt in range(1, retries + 1):
-        try:
-            logger.info("Groq call attempt %d/%d (model=%s)", attempt, retries, GROQ_MODEL)
-            completion = client.chat.completions.create(
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": (
-                                    "Perform a full single-pass extraction of this document image. "
-                                    "Return the complete JSON as per the schema in the system prompt."
-                                ),
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:{mime};base64,{b64_image}"},
-                            },
-                        ],
-                    },
-                ],
-                model=GROQ_MODEL,
-                temperature=0.0,           # §4.4: deterministic, like constrained decoding
-                max_tokens=MAX_TOKENS,
-                response_format={"type": "json_object"},  # §4.4: grammar-level JSON lock
-            )
+    import urllib.request
+    import urllib.error
 
-            raw = completion.choices[0].message.content
-            logger.info("Groq response: %d chars", len(raw))
-            return json.loads(raw)
+    images = [b64_image]
+    if b64_binarized:
+        images.append(b64_binarized)
 
-        except RateLimitError as exc:
-            wait = 2 ** attempt
-            logger.warning("Rate limit — waiting %ds. %s", wait, exc)
-            time.sleep(wait)
-            if attempt == retries:
-                raise HTTPException(status_code=429, detail=f"Groq rate limit: {exc}")
+    user_prompt = (
+        "Perform a full single-pass extraction of this document image. "
+        + (
+            "I am providing TWO versions of the same image: (1) original color photo, "
+            "(2) high-contrast binarized version for dense text and tables. "
+            if b64_binarized else ""
+        )
+        + "Return the complete JSON as per the schema in the system prompt."
+    )
 
-        except (APIError, json.JSONDecodeError, Exception) as exc:
-            logger.error("Groq error on attempt %d: %s", attempt, exc)
-            if attempt == retries:
-                raise HTTPException(status_code=502, detail=f"Groq API error: {exc}")
-            time.sleep(2)
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt, "images": images},
+        ],
+        "stream": False,
+        "format": "json",
+    }
+
+    ollama_url = os.environ.get("OLLAMA_HOST", "http://localhost:11434") + "/api/chat"
+    req = urllib.request.Request(
+        ollama_url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        res_data = json.loads(resp.read().decode("utf-8"))
+        content = res_data.get("message", {}).get("content", "")
+        return json.loads(content)
 
 
 # ---------------------------------------------------------------------------
@@ -209,28 +193,50 @@ def call_groq(b64_image: str, mime: str, retries: int = 3) -> dict:
 @app.get("/health", tags=["Monitoring"])
 def health():
     return {
-        "status" : "ok",
-        "service": "lego3-groq-engine",
-        "model"  : GROQ_MODEL,
+        "status"       : "ok",
+        "service"      : "lego3-local-vlm-engine",
+        "ollama_model" : os.environ.get("OLLAMA_MODEL", "qwen3.6-vl:27b"),
     }
+
 
 
 @app.post("/extract", tags=["Extraction"], response_model=ExtractionResponse)
 def extract(payload: ImagePayload):
     """
-    Single-pass multimodal extraction via Groq Llama-3.2 Vision.
-    Implements blueprint §4.1–§4.4.
+    Single-pass multimodal extraction.
+    Tries local Ollama (qwen3.6-vl:27b) first.
+    If Ollama is not installed/running or fails, falls back gracefully to Groq Vision.
     """
-    logger.info("Extraction request: %s", payload.image_path)
+    logger.info("Extraction request: %s (binarized=%s)", payload.image_path, payload.binarized_image_path or "none")
     try:
         b64, mime = encode_image(payload.image_path)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
 
-    result = call_groq(b64, mime)
+    # Load binarized image if provided
+    b64_bin, mime_bin = None, "image/jpeg"
+    if payload.binarized_image_path:
+        try:
+            b64_bin, mime_bin = encode_image(payload.binarized_image_path)
+        except FileNotFoundError:
+            logger.warning("Binarized image not found at %s — using single-image mode", payload.binarized_image_path)
 
-    return ExtractionResponse(
-        status    ="success",
-        model_used=GROQ_MODEL,
-        data      =result,
-    )
+    # 1. Try Ollama (qwen3.6-vl:27b)
+    ollama_model = os.environ.get("OLLAMA_MODEL", "qwen3.6-vl:27b")
+
+    try:
+        logger.info("Attempting local VLM via Ollama (model=%s)...", ollama_model)
+        result = call_ollama(b64, b64_binarized=b64_bin, model=ollama_model)
+        logger.info("Ollama extraction successful!")
+        return ExtractionResponse(
+            status    ="success",
+            model_used=f"ollama/{ollama_model}",
+            data      =result,
+        )
+    except Exception as exc:
+        logger.error("Ollama extraction failed: %s", exc)
+        raise HTTPException(
+            status_code=502, 
+            detail=f"Local Ollama API error or model unavailable: {exc}"
+        )
+

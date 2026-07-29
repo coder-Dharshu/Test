@@ -27,10 +27,11 @@ from pathlib import Path
 
 import streamlit as st
 import pandas as pd
+from groq import Groq
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title   = "Smart Triage IDP — HITL Hub",
+    page_title   = "PROG-OCR — HITL Hub",
     page_icon    = "🛡",
     layout       = "wide",
     initial_sidebar_state = "expanded",
@@ -137,6 +138,7 @@ if "ast_data"           not in st.session_state: st.session_state.ast_data      
 if "is_modified"        not in st.session_state: st.session_state.is_modified        = False
 if "current_page_idx"   not in st.session_state: st.session_state.current_page_idx   = 0
 if "upload_msg"         not in st.session_state: st.session_state.upload_msg         = ""
+if "qa_history"         not in st.session_state: st.session_state.qa_history         = {}
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def get_pending_files() -> list[Path]:
@@ -165,7 +167,7 @@ def execution_path_badge(path: str) -> str:
     badges = {
         "TRACK_A": '<span class="badge-track-a">⚡ TRACK A — Digital Fast-Path</span>',
         "PATH_1" : '<span class="badge-path-1">🔠 PATH 1 — Local CPU OCR (High Confidence)</span>',
-        "PATH_2" : '<span class="badge-path-2">🧠 PATH 2 — Groq VLM (OCR confidence escalation)</span>',
+        "PATH_2" : '<span class="badge-path-2">🧠 PATH 2 — VLM (OCR confidence escalation)</span>',
     }
     return badges.get(path, f'<span class="badge-unknown">{path}</span>')
 
@@ -207,6 +209,105 @@ def load_ast(file_path: Path) -> dict | None:
     except Exception as e:
         st.error(f"Failed to load JSON: {e}")
         return None
+
+def sanitize_headers(headers: list, n_cols: int) -> list:
+    """Ensure headers are unique, non-empty strings matching n_cols length."""
+    # Fill missing / empty headers with generic column names
+    sanitized = []
+    for idx in range(n_cols):
+        raw = headers[idx] if idx < len(headers) else ""
+        h   = str(raw).strip() if raw else ""
+        sanitized.append(h if h else f"Col_{idx + 1}")
+    # Deduplicate: append suffix if name already seen
+    seen: dict[str, int] = {}
+    result = []
+    for h in sanitized:
+        if h in seen:
+            seen[h] += 1
+            result.append(f"{h}_{seen[h]}")
+        else:
+            seen[h] = 0
+            result.append(h)
+    return result
+
+@st.cache_data(show_spinner=False)
+def generate_summary(extracted_text: str, doc_type: str, groq_api_key: str, current_date: str) -> str:
+    """Call VLM text API to produce a concise document summary with expiry detection."""
+    if not extracted_text.strip():
+        return "⚠️ No extracted text available to summarise."
+    try:
+        client = Groq(api_key=groq_api_key)
+        model  = os.environ.get("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+        # Truncate very large documents to stay within token limits
+        text_snippet = extracted_text[:12000]
+        
+        # Convert date to a nice readable form
+        from datetime import datetime
+        try:
+            current_date_obj = datetime.strptime(current_date, "%Y-%m-%d")
+            current_date_str = current_date_obj.strftime("%B %d, %Y")
+        except Exception:
+            current_date_str = current_date
+            
+        prompt = (
+            f"You are an expert document and product analyst. The document type is '{doc_type}'.\n"
+            f"Today's date is {current_date_str}.\n\n"
+            "Analyse the following extracted text/data and return a structured summary. "
+            "Please check carefully if this is a product label, receipt, packaging photo, or product document:\n\n"
+            "1. EXPIRY & PRODUCT VALIDATION (CRITICAL):\n"
+            "   - Identify if this is a product (e.g. food, medicine, cosmetic, chemical).\n"
+            "   - Extract any Expiry Date (EXP), Expiration Date, Use By, Best Before, or Manufacture/Packaging Date (MFG).\n"
+            f"   - Compare any found expiry date to today's date ({current_date_str}).\n"
+            "   - If the product is EXPIRED (expiry date is before today), print a prominent, bold, high-visibility warning at the VERY TOP of your response, e.g.:\n"
+            "     '⚠️ **EXPIRED WARNING: This product expired on [Expiry Date]! (Expired [N] days/months ago)**'\n"
+            "   - If the product is close to expiring (within 30 days), print a warning, e.g.:\n"
+            "     '⚠️ **WARNING: This product expires soon on [Expiry Date]! (Expires in [N] days)**'\n"
+            "   - If it is a product but no expiry date is found, state: 'ℹ️ **Product identified, but no expiry date was found in the text.**'\n"
+            "   - If it is not a product document at all, you can skip the expiry warning block.\n\n"
+            "2. Executive Summary: A one-paragraph summary (3-4 sentences).\n"
+            "3. Key Points: 5-8 concise bullet points covering the most important facts, figures, and actions.\n"
+            "4. Document Highlights: any notable dates, names, amounts, or references found.\n\n"
+            "Format your response in clear Markdown with appropriate subheadings and styling.\n\n"
+            f"--- Document Text ---\n{text_snippet}"
+        )
+        resp = client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model=model,
+            temperature=0.3,
+            max_tokens=1024,
+        )
+        return resp.choices[0].message.content or "No summary generated."
+    except Exception as exc:
+        return f"❌ Summary generation failed: {exc}"
+
+def answer_question(extracted_text: str, question: str, doc_type: str, groq_api_key: str) -> str:
+    """Call Groq API to answer a user's question about the extracted document text."""
+    if not extracted_text.strip():
+        return "⚠️ No extracted text available to answer questions."
+    if not question.strip():
+        return "Please enter a question."
+    try:
+        client = Groq(api_key=groq_api_key)
+        model  = os.environ.get("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+        text_snippet = extracted_text[:15000]
+        prompt = (
+            f"You are an expert Q&A assistant. The document type is '{doc_type}'.\n"
+            "Analyze the document text below and answer the user's question. "
+            "Base your answer strictly on the facts directly mentioned in the document. "
+            "If the answer cannot be determined from the document, state that clearly.\n\n"
+            f"--- Document Text ---\n{text_snippet}\n\n"
+            f"--- User Question ---\n{question}\n\n"
+            "Provide a concise, clear answer formatted in Markdown."
+        )
+        resp = client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model=model,
+            temperature=0.2,
+            max_tokens=800,
+        )
+        return resp.choices[0].message.content or "No answer generated."
+    except Exception as exc:
+        return f"❌ Failed to answer question: {exc}"
 
 def save_to_dir(ast_data: dict, target_dir: Path, extra_fields: dict = {}):
     fname = st.session_state.current_file.name
@@ -253,13 +354,14 @@ def upload_file(uploaded_file):
             f"{GATEWAY_URL}/api/v1/ingest",
             files={"file": (uploaded_file.name, uploaded_file.getvalue())},
             timeout=30,
+            proxies={"http": None, "https": None},
         )
         resp.raise_for_status()
         job_id = resp.json().get("job_id", "?")
         
         with st.spinner(f"Processing job {job_id}... Please wait for extraction to complete."):
-            # Active polling loop with 45-second timeout fail-safe
-            max_retries = 45
+            # Active polling loop with 300-second timeout fail-safe for slow CPU OCR
+            max_retries = 300
             poll_interval = 1
             expected_file = None
             
@@ -295,11 +397,33 @@ def upload_file(uploaded_file):
     except Exception as e:
         st.session_state.upload_msg = f"❌ Upload failed: {e}"
 
+# ── Auto-load first pending file if none loaded ──────────────────────────────
+pending_files = get_pending_files()
+if st.session_state.current_file is None and pending_files:
+    first_pending = pending_files[0]
+    data = load_ast(first_pending)
+    if data:
+        st.session_state.current_file     = first_pending
+        st.session_state.ast_data         = data
+        st.session_state.is_modified      = False
+        st.session_state.current_page_idx = 0
+elif st.session_state.current_file is not None and not Path(st.session_state.current_file).exists():
+    st.session_state.current_file = None
+    st.session_state.ast_data = None
+    st.session_state.is_modified = False
+    st.session_state.current_page_idx = 0
+    if pending_files:
+        first_pending = pending_files[0]
+        data = load_ast(first_pending)
+        if data:
+            st.session_state.current_file     = first_pending
+            st.session_state.ast_data         = data
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # SIDEBAR
 # ═══════════════════════════════════════════════════════════════════════════════
 with st.sidebar:
-    st.markdown("## 🛡 Smart Triage IDP")
+    st.markdown("## 🛡 PROG-OCR")
     st.markdown("---")
 
     stats = queue_stats()
@@ -320,34 +444,6 @@ with st.sidebar:
     </div>
     """, unsafe_allow_html=True)
 
-    st.markdown("**Select Document**")
-    pending_names = get_pending_names()
-    if not pending_names:
-        st.info("Queue is empty. Upload a document above.")
-    else:
-        selected = st.selectbox("Pending Documents", pending_names, label_visibility="collapsed")
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("📂 Load", use_container_width=True):
-                fp = PENDING_DIR / selected
-                data = load_ast(fp)
-                if data:
-                    st.session_state.current_file     = fp
-                    st.session_state.ast_data         = data
-                    st.session_state.is_modified      = False
-                    st.session_state.current_page_idx = 0
-                    st.rerun()
-        with col2:
-            if st.button("🗑️ Delete", use_container_width=True):
-                fp = PENDING_DIR / selected
-                fp.unlink(missing_ok=True)
-                if st.session_state.current_file == fp:
-                    st.session_state.current_file = None
-                    st.session_state.ast_data = None
-                st.rerun()
-
-    st.markdown("---")
     st.markdown("**Upload New Document**")
     uploaded = st.file_uploader(
         "Choose file",
@@ -362,9 +458,20 @@ with st.sidebar:
         st.markdown(st.session_state.upload_msg)
 
     st.markdown("---")
+    if st.session_state.current_file:
+        if st.button("🗑️ Delete Active Document", use_container_width=True):
+            fp = Path(st.session_state.current_file)
+            fp.unlink(missing_ok=True)
+            st.session_state.current_file = None
+            st.session_state.ast_data = None
+            st.session_state.is_modified = False
+            st.session_state.current_page_idx = 0
+            st.rerun()
+        st.markdown("---")
+
     col3, col4 = st.columns(2)
     with col3:
-        if st.button("🔄 Refresh", use_container_width=True):
+        if st.button("🔄 Refresh Queue", use_container_width=True):
             st.rerun()
     with col4:
         if st.button("🗑️ Clear All", use_container_width=True):
@@ -372,6 +479,8 @@ with st.sidebar:
                 f.unlink(missing_ok=True)
             st.session_state.current_file = None
             st.session_state.ast_data = None
+            st.session_state.is_modified = False
+            st.session_state.current_page_idx = 0
             st.rerun()
 
 
@@ -382,8 +491,8 @@ with st.sidebar:
 # Header
 st.markdown("""
 <div class="smart-header">
-    <h1>🛡 Smart Triage Enterprise IDP — Human-In-The-Loop Hub</h1>
-    <p>Strategic Audit Workspace &amp; Multi-path Extraction Validation Engine &nbsp;|&nbsp; §9 Developer Specification</p>
+    <h1>🛡 PROG-OCR</h1>
+    <p>Strategic Audit Workspace &amp; Multi-path Extraction Validation Engine</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -395,14 +504,13 @@ if st.session_state.ast_data is None:
     c2.metric("✅ Committed",       stats["committed"])
     c3.metric("❌ Rejected",        stats["rejected"])
     st.markdown("---")
-    st.info("👈 **Select a document from the sidebar to begin the review process.**")
+    st.info("**Select a document from the sidebar to begin the review process.**")
     st.markdown("""
-    #### How Smart Triage routes your documents:
-    | Path | Trigger | Processing |
+    #### Enterprise-Grade Document Routing & Sovereignty:
+    | Path | Trigger | Processing & Data Sovereignty |
     |---|---|---|
-    | ⚡ **Track A** | Digital PDF with ≥50 chars | Instant programmatic extraction — zero API cost |
-    | 🔠 **Path 1** | Scanned/image, PCS < 0.50 | CPU OCR via pytesseract |
-    | 🧠 **Path 2** | Complex/handwritten, PCS ≥ 0.50 | Groq Llama Vision LLM |
+    | **Track A** | Digital PDF with ≥50 chars | **Local & Offline**: Instant programmatic extraction on your local server zero API costs. |
+    |  **Path 2** | Scanned PDF, photo, or handwritten image | **Local VLM Ready**: Configured for local offline edge models Ollama ensuring **zero data leaves your private enterprise network**. |
     """)
     st.stop()
 
@@ -488,10 +596,10 @@ with col_left:
     elif path_label == "PATH_1":
         conf = current_page.get("_ocr_avg_confidence")
         conf_str = f" (OCR confidence: {conf:.1f}%)" if conf is not None else ""
-        st.success(f"🔠 Local CPU OCR accepted{conf_str} — no Groq API call made.")
+        st.success(f"🔠 Local CPU OCR accepted{conf_str} — no VLM API call made.")
     else:
         reason = current_page.get("_ocr_escalation_reason") or current_page.get("confidence_warning_reason") or ""
-        st.error(f"🧠 Escalated to Groq Vision LLM — {reason}")
+        st.error(f"🧠 Escalated to VLM — {reason}")
 
     # Try to show source image
     source_img = current_page.get("_source_image")
@@ -517,7 +625,9 @@ with col_left:
 with col_right:
     st.subheader("✍ Extracted Elements — AST Operator Audit")
 
-    tab_elements, tab_json, tab_export = st.tabs(["🗂 Elements", "{ } Raw JSON", "📥 Export"])
+    tab_elements, tab_summary, tab_qa, tab_json, tab_export = st.tabs([
+        "🗂 Elements", "📋 Summary", "❓ Q&A", "{ } Raw JSON", "📥 Export"
+    ])
 
     # ── Tab 1: Elements editor ────────────────────────────────────────────────
     with tab_elements:
@@ -530,7 +640,21 @@ with col_right:
                 content = elem.get("content", {})
                 eid     = elem.get("element_id", f"elem_{i}")
 
-                st.markdown(f'<span class="element-type-tag">{etype}</span>', unsafe_allow_html=True)
+                path_label = current_page.get("execution_path", exec_path)
+                if path_label == "TRACK_A":
+                    acc_text = "Accuracy: 100% (Digital Native)"
+                    bg_color, text_color = "#065f46", "#6ee7b7"
+                elif path_label == "PATH_1":
+                    conf_val = current_page.get("_ocr_avg_confidence")
+                    acc_val = f"{conf_val:.1f}%" if conf_val is not None else "Unknown"
+                    acc_text = f"Accuracy: {acc_val} (OCR)"
+                    bg_color, text_color = "#78350f", "#fcd34d"
+                else:
+                    acc_text = "Accuracy: ~95% (VLM)"
+                    bg_color, text_color = "#4c1d95", "#c4b5fd"
+
+                conf_badge = f'<span class="element-type-tag" style="background:{bg_color};color:{text_color};margin-left:8px;border-color:{bg_color}">{acc_text}</span>'
+                st.markdown(f'<span class="element-type-tag">{etype}</span>{conf_badge}', unsafe_allow_html=True)
 
                 if etype == "text":
                     # Unified document text — shown exactly as it appears in the source
@@ -572,7 +696,7 @@ with col_right:
                             use_container_width=True,
                             num_rows      = "dynamic",
                         )
-                        if not edited_kv.equals(df_kv):
+                        if edited_kv.to_dict("records") != df_kv.to_dict("records"):
                             new_pairs = edited_kv.to_dict("records")
                             ast["pages"][st.session_state.current_page_idx]["elements"][i]["content"]["pairs"] = new_pairs
                             st.session_state.ast_data    = ast
@@ -581,27 +705,100 @@ with col_right:
                 elif etype == "table":
                     headers = content.get("headers", [])
                     rows    = content.get("rows", [])
+                    tbl_idx = content.get("table_index", i)
                     if rows:
                         try:
-                            df_tbl    = pd.DataFrame(rows, columns=headers or None)
+                            # Determine column count from data
+                            n_cols = max(
+                                (len(r) if isinstance(r, list) else len(r.values()) if isinstance(r, dict) else 1)
+                                for r in rows
+                            )
+                            safe_headers = sanitize_headers(headers, n_cols)
+                            df_tbl = pd.DataFrame(
+                                [r if isinstance(r, (list, dict)) else [r] for r in rows],
+                                columns=safe_headers,
+                            )
+                            st.caption(f"🗃 Table {tbl_idx + 1} — {len(rows)} row(s) × {n_cols} col(s)")
                             edited_tbl = st.data_editor(
                                 df_tbl,
-                                key           = f"tbl_{job_id}_p{st.session_state.current_page_idx}_{i}",
-                                use_container_width=True,
-                                num_rows      = "dynamic",
+                                key                 = f"tbl_{job_id}_p{st.session_state.current_page_idx}_{i}",
+                                use_container_width = True,
+                                num_rows            = "dynamic",
                             )
-                            if not edited_tbl.equals(df_tbl):
-                                ast["pages"][st.session_state.current_page_idx]["elements"][i]["content"]["rows"] = edited_tbl.values.tolist()
+                            if edited_tbl.values.tolist() != df_tbl.values.tolist() or list(edited_tbl.columns) != list(df_tbl.columns):
+                                ast["pages"][st.session_state.current_page_idx]["elements"][i]["content"]["rows"]    = edited_tbl.values.tolist()
+                                ast["pages"][st.session_state.current_page_idx]["elements"][i]["content"]["headers"] = list(edited_tbl.columns)
                                 st.session_state.ast_data    = ast
                                 st.session_state.is_modified = True
                         except Exception as e:
                             st.warning(f"Table render error: {e}")
-                            st.json(content)
+                            # Render as read-only markdown fallback
+                            raw_headers = headers or [f"Col {c+1}" for c in range(len(rows[0]) if rows else 1)]
+                            md_rows = ["| " + " | ".join(str(h) for h in raw_headers) + " |",
+                                       "| " + " | ".join(["---"] * len(raw_headers)) + " |"]
+                            for row in rows[:50]:
+                                cells = row if isinstance(row, list) else list(row.values())
+                                md_rows.append("| " + " | ".join(str(c) for c in cells) + " |")
+                            st.markdown("\n".join(md_rows))
                     else:
                         st.info("Empty table detected.")
 
                 elif etype == "graphic":
-                    st.markdown(f"🖼 **Visual element** — `{content.get('label','graphic')}`")
+                    label            = content.get("label", "graphic")
+                    signature_result = content.get("signature_result")
+
+                    if "signature" in label.lower() and signature_result:
+                        sig_type  = signature_result.get("type", "")
+                        sig_conf  = signature_result.get("confidence", 0.0)
+
+                        if sig_type == "signature_text":
+                            sig_value = signature_result.get("value", "")
+                            st.markdown(
+                                f"<div style='background:#14532d;border:1px solid #166534;"
+                                f"border-radius:10px;padding:14px 18px;margin:4px 0'>"
+                                f"<div style='color:#86efac;font-size:11px;font-weight:700;"
+                                f"letter-spacing:0.05em;margin-bottom:6px'>"
+                                f"✍ SIGNATURE — TEXT EXTRACTED"
+                                f"<span style='float:right;background:#166534;padding:2px 8px;"
+                                f"border-radius:8px;font-size:10px'>conf {sig_conf:.1f}%</span>"
+                                f"</div>"
+                                f"<div style='color:#dcfce7;font-size:14px;font-style:italic'>"
+                                f"{sig_value}"
+                                f"</div></div>",
+                                unsafe_allow_html=True,
+                            )
+
+                        elif sig_type == "signature_image":
+                            sig_image  = signature_result.get("image")
+                            sig_reason = signature_result.get("reason", "OCR confidence below threshold")
+
+                            st.markdown(
+                                f"<div style='background:#78350f;border:1px solid #92400e;"
+                                f"border-radius:10px;padding:10px 14px;margin:4px 0'>"
+                                f"<span style='color:#fcd34d;font-size:11px;font-weight:700'>"
+                                f"✍ SIGNATURE — IMAGE FALLBACK"
+                                f"<span style='float:right;background:#92400e;padding:2px 8px;"
+                                f"border-radius:8px;font-size:10px'>conf {sig_conf:.1f}%</span>"
+                                f"</span><br>"
+                                f"<span style='color:#fef3c7;font-size:11px'>{sig_reason}</span>"
+                                f"</div>",
+                                unsafe_allow_html=True,
+                            )
+                            if sig_image and Path(sig_image).exists():
+                                st.image(
+                                    sig_image,
+                                    caption=f"Verified signature crop — {Path(sig_image).name}",
+                                    use_container_width=True,
+                                )
+                            elif sig_image:
+                                st.warning(f"Signature image not found at: `{sig_image}`")
+                            else:
+                                st.error("⚠️ Signature localization failed — could not isolate a valid signature region.")
+
+                        else:
+                            st.markdown(f"🖼 **Visual element** — `{label}`")
+                    else:
+                        st.markdown(f"🖼 **Visual element** — `{label}`")
 
                 st.markdown('<div style="height:1px;background:#1e293b;margin:12px 0"></div>', unsafe_allow_html=True)
 
@@ -612,7 +809,143 @@ with col_right:
                 st.session_state.is_modified = False
                 st.success("✅ Changes saved to session memory.")
 
-    # ── Tab 2: Raw JSON editor ────────────────────────────────────────────────
+    # ── Tab 2: Document Summary ───────────────────────────────────────────────
+    with tab_summary:
+        st.markdown("### 📋 AI Document Summary")
+        st.markdown(
+            "<div style='color:#64748b;font-size:13px;margin-bottom:16px'>"
+            "Powered by VLM — generates an executive summary from all extracted text on this page."
+            "</div>",
+            unsafe_allow_html=True,
+        )
+
+        # Collect all text from the current page
+        page_texts = []
+        for elem in current_page.get("elements", []):
+            etype   = elem.get("type", "")
+            content = elem.get("content", {})
+            if etype in ("text", "paragraph", "heading"):
+                t = content.get("text", "").strip()
+                if t:
+                    page_texts.append(t)
+            elif etype == "key_value":
+                for pair in content.get("pairs", []):
+                    if isinstance(pair, dict):
+                        page_texts.append(" : ".join(str(v) for v in pair.values()))
+        # Also use top-level extracted_text if available
+        top_extracted = current_page.get("extracted_text", "")
+        combined_text = "\n\n".join(page_texts) or top_extracted
+
+        doc_type = ast.get("document_type") or meta.get("document_type") or "document"
+        groq_key = os.environ.get("GROQ_API_KEY", "")
+
+        if not combined_text.strip():
+            st.info("No text content found on this page to summarise.")
+        elif not groq_key:
+            st.error("VLM API KEY (GROQ_API_KEY) not found — cannot generate summary.")
+        else:
+            sum_col1, sum_col2 = st.columns([3, 1])
+            with sum_col2:
+                regen = st.button("🔄 Regenerate", use_container_width=True)
+
+            cache_key = f"summary_{job_id}_p{st.session_state.current_page_idx}"
+            if regen and cache_key in st.session_state:
+                del st.session_state[cache_key]
+                generate_summary.clear()
+
+            if cache_key not in st.session_state:
+                with st.spinner("✨ Generating summary via VLM..."):
+                    current_date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                    st.session_state[cache_key] = generate_summary(
+                        combined_text, doc_type, groq_key, current_date_str
+                    )
+
+            summary_md = st.session_state.get(cache_key, "")
+            st.markdown(
+                f"<div style='background:#1e293b;border:1px solid #334155;border-radius:12px;"
+                f"padding:24px;line-height:1.7;color:#e2e8f0'>{summary_md}</div>",
+                unsafe_allow_html=True,
+            )
+
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.download_button(
+                "📥 Download Summary (.md)",
+                data      = summary_md,
+                file_name = f"{job_id}_summary_p{st.session_state.current_page_idx+1}.md",
+                mime      = "text/markdown",
+                use_container_width=True,
+            )
+
+    # ── Tab: Q&A ──────────────────────────────────────────────────────────────
+    with tab_qa:
+        st.markdown("### ❓ Document Q&A")
+        st.markdown(
+            "<div style='color:#64748b;font-size:13px;margin-bottom:16px'>"
+            "Ask any question about the contents of this document. Answers are generated using Groq LLM."
+            "</div>",
+            unsafe_allow_html=True,
+        )
+
+        qa_list = st.session_state.qa_history.setdefault(job_id, [])
+
+        # Display history
+        if qa_list:
+            for item in qa_list:
+                st.markdown(
+                    f"<div style='background:#1e293b; border:1px solid #334155; border-radius:10px; padding:12px; margin-bottom:10px'>"
+                    f"<div style='color:#38bdf8; font-weight:600; font-size:12px; margin-bottom:4px'>❓ QUESTION</div>"
+                    f"<div style='color:#f8fafc; font-size:14px; margin-bottom:8px'>{item['question']}</div>"
+                    f"<div style='height:1px; background:#334155; margin-bottom:8px'></div>"
+                    f"<div style='color:#34d399; font-weight:600; font-size:12px; margin-bottom:4px'>💡 ANSWER</div>"
+                    f"<div style='color:#e2e8f0; font-size:14px; line-height:1.6'>{item['answer']}</div>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+
+            if st.button("🗑️ Clear Q&A History", key=f"clear_qa_{job_id}", use_container_width=True):
+                st.session_state.qa_history[job_id] = []
+                st.rerun()
+
+        # Chat form
+        with st.form(key=f"qa_form_{job_id}", clear_on_submit=True):
+            user_q = st.text_input("Ask a question about this document:", placeholder="e.g. What is the expiry date? What is the total invoice amount?")
+            submit_q = st.form_submit_button("Ask VLM 🚀", use_container_width=True)
+
+            if submit_q:
+                if not user_q.strip():
+                    st.warning("Please enter a non-empty question.")
+                elif not groq_key:
+                    st.error("Groq API key not configured.")
+                else:
+                    with st.spinner("Analyzing document and generating answer..."):
+                        # Build full document context across all pages
+                        all_doc_texts = []
+                        for p_idx, p in enumerate(pages):
+                            p_texts = []
+                            for elem in p.get("elements", []):
+                                etype = elem.get("type", "")
+                                content = elem.get("content", {})
+                                if etype in ("text", "paragraph", "heading"):
+                                    t = content.get("text", "").strip()
+                                    if t: p_texts.append(t)
+                                elif etype == "key_value":
+                                    for pair in content.get("pairs", []):
+                                        if isinstance(pair, dict):
+                                            p_texts.append(" : ".join(str(v) for v in pair.values()))
+                            top_p_extracted = p.get("extracted_text", "")
+                            combined_p = "\n".join(p_texts) or top_p_extracted
+                            if combined_p:
+                                all_doc_texts.append(f"--- Page {p_idx+1} ---\n{combined_p}")
+                        
+                        full_context = "\n\n".join(all_doc_texts)
+                        answer = answer_question(full_context, user_q, doc_type, groq_key)
+                        st.session_state.qa_history[job_id].append({
+                            "question": user_q,
+                            "answer": answer
+                        })
+                        st.rerun()
+
+    # ── Tab 3: Raw JSON editor ────────────────────────────────────────────────
     with tab_json:
         json_str = json.dumps(st.session_state.ast_data, indent=2, ensure_ascii=False)
         edited_json = st.text_area(

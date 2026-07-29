@@ -210,34 +210,425 @@ def stitch_multipage_tables(page_data_list: list[dict]) -> list[dict]:
 # ---------------------------------------------------------------------------
 # §4.3 Visual Grounding — Crop image assets from bounding boxes
 # ---------------------------------------------------------------------------
+
+# Minimum OCR confidence (0–100) to accept extracted signature text.
+SIGNATURE_OCR_CONFIDENCE_THRESHOLD = float(
+    os.environ.get("SIGNATURE_OCR_CONFIDENCE_THRESHOLD", "40.0")
+)
+# Image-analysis thresholds (can be tuned via env vars).
+SIG_MIN_INK_RATIO     = float(os.environ.get("SIG_MIN_INK_RATIO",     "0.02"))   # ≥ 2 % ink
+SIG_MAX_INK_RATIO     = float(os.environ.get("SIG_MAX_INK_RATIO",     "0.55"))   # ≤ 55 % ink (not fully black)
+SIG_MIN_STROKE_CV     = float(os.environ.get("SIG_MIN_STROKE_CV",     "0.35"))   # stroke irregularity
+SIG_MAX_TEXT_DENSITY  = float(os.environ.get("SIG_MAX_TEXT_DENSITY",  "0.30"))   # ≤ 30 % printed text area
+SIG_MIN_ASPECT        = float(os.environ.get("SIG_MIN_ASPECT",        "0.25"))   # width / height ≥ 0.25
+
+# OCR keywords that betray the wrong region was cropped.
+_SIGNATURE_REJECT_KEYWORDS = [
+    "address", "street", "road", "lane", "avenue", "drive", "close",
+    "city", "town", "county", "postcode", "zip", "state",
+    "job ref", "job number", "job sheet", "invoice", "date:", "total:",
+    "labour:", "customer name", "phone", "email", "tel:", "fax:",
+    "work carried", "description", "amount", "quantity",
+    "parts:", "materials:", "vat", "tax", "boiler", "pressure",
+]
+
+# Words that indicate the signature field label in the document.
+_SIGNATURE_FIELD_LABELS = [
+    "signature", "signed", "customer sig", "authorised", "authorized",
+    "sign here", "signatory",
+]
+
+
+# ── Low-level helpers ────────────────────────────────────────────────────────
+
+def _ocr_crop(crop_bgr) -> tuple[str, float]:
+    """Run pytesseract on BGR crop → (text, avg_confidence)."""
+    try:
+        import pytesseract  # type: ignore
+        rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+        df  = pytesseract.image_to_data(
+            rgb, output_type=pytesseract.Output.DATAFRAME, config="--psm 6"
+        )
+        df = df[df["conf"] > 0]
+        if df.empty:
+            return "", 0.0
+        text = " ".join(df["text"].astype(str).str.strip().tolist()).strip()
+        return text, float(df["conf"].mean())
+    except Exception:
+        return "", 0.0
+
+
+def _ocr_crop_dict(crop_bgr) -> list[dict]:
+    """Return per-word OCR entries for re-localization."""
+    try:
+        import pytesseract  # type: ignore
+        rgb  = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+        data = pytesseract.image_to_data(
+            rgb, output_type=pytesseract.Output.DICT, config="--psm 6"
+        )
+        n = len(data["text"])
+        return [
+            {
+                "text": str(data["text"][i]).strip(),
+                "conf": int(data["conf"][i]),
+                "left": int(data["left"][i]),
+                "top" : int(data["top"][i]),
+                "w"   : int(data["width"][i]),
+                "h"   : int(data["height"][i]),
+            }
+            for i in range(n)
+            if str(data["text"][i]).strip()
+        ]
+    except Exception:
+        return []
+
+
+def _ocr_text_density(crop_bgr) -> float:
+    """
+    Return the fraction (0–1) of the crop area covered by OCR-detected text
+    bounding boxes whose confidence > 30.  Used to enforce the 30 % printed-
+    text limit on the fallback image.
+    """
+    try:
+        import pytesseract  # type: ignore
+        rgb  = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+        data = pytesseract.image_to_data(
+            rgb, output_type=pytesseract.Output.DICT, config="--psm 6"
+        )
+        h, w = crop_bgr.shape[:2]
+        total = max(h * w, 1)
+        covered = 0
+        for i in range(len(data["text"])):
+            if int(data["conf"][i]) > 30 and str(data["text"][i]).strip():
+                covered += int(data["width"][i]) * int(data["height"][i])
+        return min(covered / total, 1.0)
+    except Exception:
+        return 0.0
+
+
+# ── Core image-analysis validator ────────────────────────────────────────────
+
+def _verify_signature_image(crop_bgr) -> dict:
+    """
+    Determine whether a BGR crop contains a handwritten signature.
+
+    Checks (in order):
+      1. Aspect ratio — crop must be wider than it is narrow.
+      2. Ink coverage — dark pixels must cover ≥ SIG_MIN_INK_RATIO and
+         ≤ SIG_MAX_INK_RATIO of the crop (blank or solid-black crops are rejected).
+      3. Printed-text density — OCR-detected text boxes must cover
+         ≤ SIG_MAX_TEXT_DENSITY (30 %) of the crop area.
+      4. Keyword rejection — OCR text must not contain document-field keywords
+         (address, customer name, table headers, etc.).
+      5. Word count — fewer than 13 OCR words (signatures are short).
+      6. Stroke irregularity — the coefficient of variation of stroke widths
+         (via distance transform on the binarised crop) must be ≥ SIG_MIN_STROKE_CV,
+         indicating organic, hand-drawn strokes rather than uniform print.
+
+    Returns:
+        {
+          "is_signature" : bool,
+          "reason"       : str,
+          "confidence"   : float   # 0–1
+        }
+    """
+    if crop_bgr is None or crop_bgr.size == 0:
+        return {"is_signature": False, "reason": "empty crop", "confidence": 0.0}
+
+    h, w = crop_bgr.shape[:2]
+    score_parts: list[float] = []
+
+    # ── 1. Aspect ratio ──────────────────────────────────────────────────────
+    aspect = w / max(h, 1)
+    if aspect < SIG_MIN_ASPECT:
+        return {
+            "is_signature": False,
+            "reason"      : f"crop too narrow (aspect={aspect:.2f}) — not a signature region",
+            "confidence"  : 0.05,
+        }
+    score_parts.append(min(aspect / 3.0, 1.0) * 0.10)   # aspect contributes 10 % of score
+
+    # ── 2. Ink coverage ───────────────────────────────────────────────────────
+    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+    # Adaptive threshold to isolate ink on varied backgrounds
+    binary = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 15, 8
+    )
+    ink_ratio = float(np.sum(binary > 0)) / max(h * w, 1)
+
+    if ink_ratio < SIG_MIN_INK_RATIO:
+        return {
+            "is_signature": False,
+            "reason"      : f"insufficient ink ({ink_ratio:.1%}) — blank or near-blank crop",
+            "confidence"  : round(ink_ratio / SIG_MIN_INK_RATIO * 0.15, 2),
+        }
+    if ink_ratio > SIG_MAX_INK_RATIO:
+        return {
+            "is_signature": False,
+            "reason"      : f"too much ink ({ink_ratio:.1%}) — likely a dense text block, not a signature",
+            "confidence"  : 0.10,
+        }
+    # Ideal ink ratio for a signature is roughly 5–25 %
+    ink_score = 1.0 - abs(ink_ratio - 0.12) / 0.12
+    score_parts.append(max(ink_score, 0.0) * 0.25)   # ink contributes 25 %
+
+    # ── 3. Printed-text density (OCR area check) ──────────────────────────────
+    text_density = _ocr_text_density(crop_bgr)
+    if text_density > SIG_MAX_TEXT_DENSITY:
+        return {
+            "is_signature": False,
+            "reason"      : f"printed text covers {text_density:.0%} of crop (limit {SIG_MAX_TEXT_DENSITY:.0%}) — likely a text region",
+            "confidence"  : round((1.0 - text_density) * 0.3, 2),
+        }
+    score_parts.append((1.0 - text_density) * 0.25)   # text-density contributes 25 %
+
+    # ── 4 & 5. OCR keyword + word-count check ────────────────────────────────
+    text, _conf = _ocr_crop(crop_bgr)
+    text_lower  = text.lower()
+    for kw in _SIGNATURE_REJECT_KEYWORDS:
+        if kw in text_lower:
+            return {
+                "is_signature": False,
+                "reason"      : f"OCR found document keyword '{kw}' — wrong region cropped",
+                "confidence"  : 0.05,
+            }
+    word_count = len(text.split())
+    if word_count > 12:
+        return {
+            "is_signature": False,
+            "reason"      : f"OCR returned {word_count} words — too many for a signature",
+            "confidence"  : 0.10,
+        }
+    score_parts.append(max(0.0, 1.0 - word_count / 12.0) * 0.15)   # word-count 15 %
+
+    # ── 6. Stroke irregularity (distance-transform CV) ───────────────────────
+    dist        = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
+    stroke_vals = dist[dist > 0]
+    if len(stroke_vals) < 50:
+        stroke_cv = 0.0
+    else:
+        stroke_cv = float(np.std(stroke_vals)) / (float(np.mean(stroke_vals)) + 1e-6)
+
+    if stroke_cv < SIG_MIN_STROKE_CV:
+        return {
+            "is_signature": False,
+            "reason"      : f"stroke irregularity too low (CV={stroke_cv:.2f}) — uniform print-like strokes",
+            "confidence"  : round(stroke_cv / SIG_MIN_STROKE_CV * 0.4, 2),
+        }
+    score_parts.append(min(stroke_cv / 1.5, 1.0) * 0.25)   # irregularity 25 %
+
+    confidence = round(sum(score_parts), 2)
+    return {
+        "is_signature": True,
+        "reason"      : (
+            f"ink={ink_ratio:.1%}, text_density={text_density:.1%}, "
+            f"stroke_CV={stroke_cv:.2f}, words={word_count}"
+        ),
+        "confidence"  : confidence,
+    }
+
+
+# ── Re-localization strategies ───────────────────────────────────────────────
+
+def _relocate_signature(
+    full_image: np.ndarray,
+    job_id: str,
+    max_attempts: int = 3,
+) -> tuple[np.ndarray | None, str]:
+    """
+    Re-detect the signature region when the VLM-provided box failed validation.
+
+    Strategy 1 — Label-anchored:
+      Find a word matching a signature field label via full-doc OCR, then crop
+      the region immediately to the right of the label (where handwriting lives).
+      Tries progressively wider windows if the first attempt fails validation.
+
+    Strategy 2 — Bottom-band heuristic:
+      Scan horizontal bands in the bottom 35 % of the document, returning the
+      first band that passes _verify_signature_image.
+
+    Returns (crop | None, strategy_description).
+    """
+    h, w = full_image.shape[:2]
+    attempts: list[tuple[np.ndarray, str]] = []
+
+    # ── Strategy 1: Label-anchored ───────────────────────────────────────────
+    words = _ocr_crop_dict(full_image)
+    for entry in words:
+        if not (any(kw in entry["text"].lower() for kw in _SIGNATURE_FIELD_LABELS)
+                and entry["conf"] > 10):
+            continue
+        lx, ly, lw, lh = entry["left"], entry["top"], entry["w"], entry["h"]
+        logger.info("[%s] Sig label '%s' at (%d,%d)", job_id, entry["text"], lx, ly)
+
+        for pad_mult in (3, 5, 7):                     # widen vertically on retry
+            pad = max(lh * pad_mult, 40)
+            sx1 = min(lx + lw, w)
+            sy1 = max(ly - lh, 0)
+            sx2 = w
+            sy2 = min(ly + pad, h)
+            if (sx2 - sx1) < w * 0.15:                # too narrow → widen left
+                sx1 = max(0, lx - lw * 2)
+            crop = full_image[sy1:sy2, sx1:sx2]
+            if crop.size > 0:
+                attempts.append((crop, f"label_anchor_pad{pad_mult}"))
+
+    # ── Strategy 2: Bottom-band scan ─────────────────────────────────────────
+    band_top = int(h * 0.60)
+    for y1 in range(band_top, int(h * 0.90), max(int(h * 0.04), 10)):
+        y2   = min(y1 + int(h * 0.18), h)
+        crop = full_image[y1:y2, :]
+        if crop.size > 0:
+            attempts.append((crop, f"bottom_band_y{y1}"))
+
+    # ── Validate each candidate ───────────────────────────────────────────────
+    best_crop, best_strategy, best_conf = None, "failed", 0.0
+    for crop, strategy in attempts:
+        result = _verify_signature_image(crop)
+        logger.debug(
+            "[%s] Candidate '%s': is_sig=%s conf=%.2f reason=%s",
+            job_id, strategy, result["is_signature"], result["confidence"], result["reason"]
+        )
+        if result["is_signature"] and result["confidence"] > best_conf:
+            best_crop, best_strategy, best_conf = crop, strategy, result["confidence"]
+            if best_conf >= 0.70:          # good enough — stop early
+                break
+
+    if best_crop is not None:
+        logger.info("[%s] Re-located signature via '%s' (conf=%.2f)", job_id, best_strategy, best_conf)
+        return best_crop, best_strategy
+
+    logger.warning("[%s] All %d relocation candidates failed validation", job_id, len(attempts))
+    return None, "failed"
+
+
+# ── Text-content verifier ─────────────────────────────────────────────────────
+
+def _is_signature_like_text(text: str) -> bool:
+    """True if OCR text could be a name/initials rather than document metadata."""
+    if not text:
+        return False
+    text_lower = text.lower()
+    for kw in _SIGNATURE_REJECT_KEYWORDS:
+        if kw in text_lower:
+            return False
+    return len(text.split()) <= 5
+
+
+# ── Main entry point ─────────────────────────────────────────────────────────
+
 def crop_visual_assets(source_image_path: str, grounding_results: list, job_id: str) -> list[str]:
     """
-    Blueprint §4.3 — crop detected logos / diagrams from the source image
-    using coordinates returned by the VLM.
+    Blueprint §4.3 — crop visual regions and apply the full signature pipeline:
+
+      1. Crop VLM box → run _verify_signature_image.
+      2. If invalid  → _relocate_signature (label-anchor + bottom-band scan).
+      3. If still no valid crop → return SIGNATURE_DETECTION_FAILED (no image).
+      4. OCR the verified crop → if text passes _is_signature_like_text → text output.
+      5. Else → image fallback with the validated crop.
+
+    All results are written in-place onto grounding_results items so the AST
+    compiler can embed them in graphic elements.
     Returns list of saved asset paths.
     """
     if not source_image_path or not os.path.exists(source_image_path):
         return []
-
     image = cv2.imread(source_image_path)
     if image is None:
         return []
 
-    saved_paths = []
+    img_h, img_w = image.shape[:2]
+    saved_paths  = []
+
     for idx, item in enumerate(grounding_results):
         box   = item.get("box_2d", [])
         label = item.get("label", f"asset_{idx}")
         if len(box) != 4:
             continue
+
         x_min, y_min, x_max, y_max = [int(c) for c in box]
-        crop = image[y_min:y_max, x_min:x_max]
+        x_min = max(0, x_min); y_min = max(0, y_min)
+        x_max = min(img_w, x_max); y_max = min(img_h, y_max)
+        crop  = image[y_min:y_max, x_min:x_max]
         if crop.size == 0:
             continue
+
         asset_filename = f"{job_id}_asset_{idx}_{label}.jpg"
         asset_path     = os.path.join(ASSETS_DIR, asset_filename)
         cv2.imwrite(asset_path, crop)
         saved_paths.append(asset_path)
         logger.info("Cropped visual asset: %s", asset_path)
+
+        if "signature" not in label.lower():
+            continue
+
+        # ── Step 1: Validate VLM-provided crop ──────────────────────────────
+        reloc_strategy = "vlm_box"
+        vlm_check      = _verify_signature_image(crop)
+        logger.info(
+            "[%s] VLM box validation: is_sig=%s conf=%.2f | %s",
+            job_id, vlm_check["is_signature"], vlm_check["confidence"], vlm_check["reason"]
+        )
+
+        if not vlm_check["is_signature"]:
+            logger.warning(
+                "[%s] Signature crop REJECTED (%s) — re-localizing",
+                job_id, vlm_check["reason"]
+            )
+            # ── Step 2: Re-localize ─────────────────────────────────────────
+            relocated, reloc_strategy = _relocate_signature(image, job_id)
+
+            if relocated is not None and relocated.size > 0:
+                crop = relocated
+                cv2.imwrite(asset_path, crop)      # overwrite asset with verified crop
+                logger.info(
+                    "[%s] Signature asset updated from re-localization (%s)",
+                    job_id, reloc_strategy
+                )
+            else:
+                # ── Step 3: Full detection failure ──────────────────────────
+                item["signature_result"] = {
+                    "type"      : "SIGNATURE_DETECTION_FAILED",
+                    "reason"    : (
+                        f"VLM crop invalid ({vlm_check['reason']}); "
+                        "re-localization could not find a valid signature region"
+                    ),
+                    "confidence": 0.0,
+                    "image"     : None,
+                }
+                logger.error("[%s] SIGNATURE_DETECTION_FAILED", job_id)
+                continue
+
+        # ── Step 4: OCR on verified crop ─────────────────────────────────────
+        text, ocr_conf = _ocr_crop(crop)
+
+        if text and ocr_conf >= SIGNATURE_OCR_CONFIDENCE_THRESHOLD and _is_signature_like_text(text):
+            item["signature_result"] = {
+                "type"      : "signature_text",
+                "value"     : text,
+                "confidence": round(ocr_conf, 1),
+            }
+            logger.info(
+                "[%s] Signature text extracted (conf=%.1f%%): '%s'",
+                job_id, ocr_conf, text[:80]
+            )
+        else:
+            # ── Step 5: Validated image fallback ─────────────────────────────
+            ocr_reason = (
+                f"OCR confidence {ocr_conf:.1f}% < threshold {SIGNATURE_OCR_CONFIDENCE_THRESHOLD:.0f}%"
+                if ocr_conf < SIGNATURE_OCR_CONFIDENCE_THRESHOLD
+                else "OCR result does not resemble a signature"
+            )
+            item["signature_result"] = {
+                "type"      : "signature_image",
+                "reason"    : ocr_reason,
+                "confidence": round(ocr_conf, 1),
+                "image"     : asset_path,
+            }
+            logger.info(
+                "[%s] Signature image fallback — %s | strategy=%s",
+                job_id, ocr_reason, reloc_strategy
+            )
 
     return saved_paths
 
@@ -320,19 +711,28 @@ def run_pipeline(file_path: str, job_id: str, source_filename: str):
         # ── Smart Triage path ────────────────────────────────────────────
         if orchestrator is not None:
             routing_result = orchestrator.route_document(file_path, job_id)
-            final_data     = ast_compiler.compile(routing_result, source_filename)
             exec_val       = routing_result.get("execution_path", ExecutionPath.PATH_2_HIGH_COMPLEXITY)
             exec_path      = exec_val.value if hasattr(exec_val, "value") else exec_val
             pcs_score      = routing_result.get("pcs_score", 0.0)
 
-            # Crop visual assets from VLM grounding coordinates
+            # ── Step 1: Crop visual assets BEFORE compiling the AST ──────
+            # crop_visual_assets writes signature_result in-place onto each
+            # grounding item.  The AST compiler must run AFTER this so it
+            # can embed signature_result into the graphic elements.
+            asset_paths = []
             if exec_path == "PATH_2":
                 pages     = routing_result.get("pages", [])
                 page0     = pages[0] if pages else {}
-                grounding = page0.pop("visual_grounding", []) or []
+                # Use .get() (not .pop()) so visual_grounding is still present
+                # when ast_compiler.compile() reads the routing_result below.
+                grounding = page0.get("visual_grounding", []) or []
                 if grounding:
                     asset_paths = crop_visual_assets(file_path, grounding, job_id)
-                    final_data["_asset_paths"] = asset_paths
+
+            # ── Step 2: Compile AST — now sees enriched grounding data ───
+            final_data = ast_compiler.compile(routing_result, source_filename)
+            if asset_paths:
+                final_data["_asset_paths"] = asset_paths
 
             pipeline_name = routing_result.get("_pipeline", exec_path.lower())
 

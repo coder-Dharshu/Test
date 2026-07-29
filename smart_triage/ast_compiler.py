@@ -155,13 +155,17 @@ class ASTCompiler:
         # ── Visual grounding → graphic elements ──
         grounding = page_raw.get("visual_grounding", []) or []
         for g_idx, g in enumerate(grounding):
-            box   = g.get("box_2d", [0, 0, 100, 100])
-            label = g.get("label", "graphic")
+            box              = g.get("box_2d", [0, 0, 100, 100])
+            label            = g.get("label", "graphic")
+            signature_result = g.get("signature_result")   # set by crop_visual_assets for signatures
+            content: dict = {"label": label}
+            if signature_result:
+                content["signature_result"] = signature_result
             elements.append({
                 "element_id": f"p{page_index}_g{g_idx}_{str(uuid.uuid4())[:6]}",
                 "type"      : "graphic",
                 "bbox"      : self._normalize_bbox(box, 1000, 1000),
-                "content"   : {"label": label},
+                "content"   : content,
             })
 
         # ── Confidence metadata ──

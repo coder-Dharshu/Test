@@ -7,9 +7,9 @@ Dynamic Routing (Local-First, Confidence-Gated):
   Track A  — Vector-native PDF     → Programmatic pypdf extraction (zero API cost)
   Track B  — Raster / Scanned     → Always try CPU OCR locally first
     Path 1   (OCR confidence >= 80%) → Accept local result (zero API cost)
-    Path 2   (OCR confidence <  80%) → Escalate to Groq Vision LLM as fallback
+    Path 2   (OCR confidence <  80%) → Escalate to VLM as fallback
 
-The Groq API is a LAST RESORT only — called when local extraction quality
+The VLM API is a LAST RESORT only — called when local extraction quality
 is below the confidence threshold (default 80%). The PCS score is still
 calculated for display/audit purposes in the HITL dashboard.
 
@@ -18,9 +18,9 @@ PCS Formula (§2.2) — used for display only:
 """
 
 import os
-import io
-import uuid
+import time
 import json
+import uuid
 import logging
 import asyncio
 import requests
@@ -28,7 +28,12 @@ import base64
 import string
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Optional, Any
+
+# Prevent PaddleOCR / oneDNN deadlocks in Uvicorn threads
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
 import cv2
 import numpy as np
@@ -101,7 +106,7 @@ MIN_TEXT_CHARS = 50
 
 # Local-first confidence gate:
 # If CPU OCR average confidence is >= this value, accept local result (no API call).
-# If confidence is BELOW this value, escalate to Groq Vision LLM.
+# If confidence is BELOW this value, escalate to VLM.
 OCR_CONFIDENCE_THRESHOLD = 80.0  # percent (0–100)
 
 
@@ -129,13 +134,29 @@ class SmartTriageOrchestrator:
         
         # Initialize persistent OCR engines to prevent timeout bottlenecks
         if PADDLE_AVAILABLE:
+            # Disable OneDNN/MKL-DNN to prevent fused_conv2d crash on some
+            # Windows CPU builds (NotFoundError: OneDnnContext missing Filter).
+            os.environ["FLAGS_use_mkldnn"] = "0"
+            os.environ["MKLDNN_VERBOSE"] = "0"
+
             from paddleocr import PaddleOCR
-            from img2table.ocr import PaddleOCR as Img2TablePaddleOCR
-            self.paddle_ocr_engine = PaddleOCR(use_angle_cls=True, lang='en', det_limit_side_len=1600, det_db_thresh=0.3, det_db_box_thresh=0.5)
-            self.img2table_ocr_wrapper = Img2TablePaddleOCR(lang="en")
+            self.paddle_ocr_engine = PaddleOCR(
+                use_angle_cls=True,
+                lang="en",
+                det_limit_side_len=1600,
+                det_db_thresh=0.3,
+                det_db_box_thresh=0.5,
+                enable_mkldnn=False,
+            )
+            # img2table PaddleOCR wrapper is intentionally NOT initialized.
+            # It crashes with OneDNN PIR errors on Windows (ConvertPirAttribute2RuntimeAttribute).
+            # Table extraction is done via heuristic row-clustering on PaddleOCR coordinates instead.
+            self.img2table_ocr_wrapper = None
+
         else:
             self.paddle_ocr_engine = None
             self.img2table_ocr_wrapper = None
+
 
         logger.info(
             "SmartTriageOrchestrator ready | OCR confidence gate=%.0f%% | pdfium=%s | paddle=%s",
@@ -316,7 +337,7 @@ class SmartTriageOrchestrator:
           A. total_extractable_chars >= MIN_TEXT_CHARS  (default 50)
           B. printable_char_ratio    >= MIN_PRINTABLE_RATIO  (default 0.85)
 
-          → DIGITAL PDF : skip OCR entirely, skip Groq entirely
+          → DIGITAL PDF : skip OCR entirely, skip VLM entirely
           → SCANNED PDF : route to Track B (OCR pipeline)
 
         The printable-ratio gate catches PDFs that embed stray font-cmap
@@ -603,25 +624,46 @@ class SmartTriageOrchestrator:
 
     # ── Pre-processing (Glare Suppression + Deskew) ───────────────────────────
 
-    def preprocess_image(self, image_bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def preprocess_image(self, image_bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        Apply deskew correction and specular glare suppression (TELEA + CLAHE).
-        Returns cleaned BGR image array.
+        Apply gentle preprocessing for OCR.
+        Returns (enhanced_bgr, original_downscaled_bgr, binarized_bgr).
+
+        - enhanced_bgr: CLAHE-sharpened for PaddleOCR text detection
+        - original_downscaled_bgr: real photo for VLM color context and HITL preview
+        - binarized_bgr: adaptive threshold B&W for img2table table detection
+          and as a second VLM input for dense small-text tables
         """
-        # Deskew removed to fix 90-degree misrotation bug for handwritten notebooks
-        
-        # Adaptive downscaling to standard width (1600px)
+        # Adaptive downscaling to standard width (1600px max)
         h, w = image_bgr.shape[:2]
         if w > 1600:
             scale = 1600 / float(w)
             image_bgr = cv2.resize(image_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
 
-        # Binarization for mobile captures
-        gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-        binarized = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 21, 11)
-        cleaned = cv2.cvtColor(binarized, cv2.COLOR_GRAY2BGR)
-        
-        return cleaned, image_bgr
+        # Keep original downscaled for VLM (do NOT binarize — destroys color context)
+        original_downscaled = image_bgr.copy()
+
+        # Light CLAHE enhancement for OCR (improves contrast without destroying image)
+        lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
+        l_channel, a_channel, b_channel = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        l_channel = clahe.apply(l_channel)
+        enhanced = cv2.merge([l_channel, a_channel, b_channel])
+        enhanced_bgr = cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
+
+        # Binarized version for table detection and as secondary VLM input
+        # Use a mild Gaussian blur first to reduce noise, then adaptive threshold
+        gray = cv2.cvtColor(enhanced_bgr, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+        binarized_gray = cv2.adaptiveThreshold(
+            blurred, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY,
+            blockSize=21, C=8
+        )
+        # Convert back to BGR so it can be saved as JPEG / used by cv2 functions
+        binarized_bgr = cv2.cvtColor(binarized_gray, cv2.COLOR_GRAY2BGR)
+
+        return enhanced_bgr, original_downscaled, binarized_bgr
 
     # ── Path 1: CPU OCR ───────────────────────────────────────────────────────
 
@@ -646,7 +688,9 @@ class SmartTriageOrchestrator:
 
         # Run OCR with PaddleOCR engine
         try:
+            logger.info("-> Starting paddle_ocr_engine.ocr(binarized_bgr)")
             results = self.paddle_ocr_engine.ocr(binarized_bgr)
+            logger.info("-> Finished paddle_ocr_engine.ocr(binarized_bgr)")
             # Handle empty results or nested structure
             if not results or results[0] is None:
                 lines = []
@@ -681,8 +725,13 @@ class SmartTriageOrchestrator:
         confidences = []
 
         for line in lines:
-            box, (text, conf) = line
-            text = text.strip()
+            if not isinstance(line, (list, tuple)) or len(line) != 2:
+                continue
+            box, text_conf = line
+            if not isinstance(text_conf, (list, tuple)) or len(text_conf) != 2:
+                continue
+            text, conf = text_conf
+            text = str(text).strip()
             if not text:
                 continue
                 
@@ -706,7 +755,6 @@ class SmartTriageOrchestrator:
             })
 
         raw_text = "\n".join(texts)
-        
         # Simple KV pair heuristic: "Key: Value" patterns
         import re
         kv_pairs: dict[str, str] = {}
@@ -715,62 +763,105 @@ class SmartTriageOrchestrator:
             if m:
                 kv_pairs[m.group(1).strip()] = m.group(2).strip()
 
-        # Task 2: Dual-Engine Local Extraction (Path 1) -> For Tables
+        # ── Task 2: Table extraction via img2table (structure) + PaddleOCR (text) ──
+        # Strategy:
+        #   1. img2table detects table borders/structure on the binarized image
+        #   2. We match detected table cell bounding boxes against our PaddleOCR
+        #      coordinate data to fill cell text
+        # Fallback: coordinate-based row clustering if img2table fails
         tables_out = []
         try:
             from img2table.document import Image as Img2TableImage
-            from img2table.ocr import PaddleOCR as Img2TablePaddleOCR
             import tempfile
-            import os
-            
+
             with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+                # Use BINARIZED image for border/line detection
                 cv2.imwrite(tmp.name, target_img_for_tables)
                 tmp_path = tmp.name
-                
+
             img_doc = Img2TableImage(tmp_path)
-            
-            if self.img2table_ocr_wrapper:
-                extracted = img_doc.extract_tables(ocr=self.img2table_ocr_wrapper, implicit_rows=True, borderless_tables=True, min_confidence=50)
-            else:
-                extracted = []
-            
+
+            logger.info("-> Starting img2table.extract_tables")
+            try:
+                from img2table.ocr import TesseractOCR
+                ocr_engine = TesseractOCR(n_threads=1, lang="eng")
+                logger.info("   using TesseractOCR backend")
+            except Exception:
+                from img2table.ocr import EasyOCR as Img2EasyOCR
+                ocr_engine = Img2EasyOCR(lang=["en"])
+                logger.info("   using EasyOCR backend (Tesseract unavailable)")
+
+            extracted = img_doc.extract_tables(
+                ocr=ocr_engine,
+                implicit_rows=True,
+                borderless_tables=True,   # critical for nutrition-fact / borderless tables
+                min_confidence=30,
+            )
+            logger.info("-> img2table found %d table(s)", len(extracted) if extracted else 0)
+
             if extracted:
-                for tbl in extracted:
+                for tbl_idx, tbl in enumerate(extracted):
                     df = tbl.df
                     if df is not None and not df.empty:
                         df_str = df.astype(str).fillna("")
-                        headers = df_str.iloc[0].tolist()
+                        headers = [str(h) for h in df_str.columns.tolist()]
                         rows_list = []
-                        for _, row in df_str.iloc[1:].iterrows():
-                            row_dict = {}
-                            for j, cell in enumerate(row):
-                                col_name = headers[j] if j < len(headers) else f"Col_{j}"
-                                row_dict[col_name] = str(cell).strip()
-                            rows_list.append(row_dict)
-                        
+                        for _, row in df_str.iterrows():
+                            row_dict = {str(col): str(val).strip() for col, val in row.items()}
+                            if any(v.strip() for v in row_dict.values()):
+                                rows_list.append(row_dict)
                         if rows_list:
                             tables_out.append({
-                                "headers": headers,
-                                "rows": rows_list,
-                                "table_index": len(tables_out)
+                                "headers"    : headers,
+                                "rows"       : rows_list,
+                                "table_index": len(tables_out),
                             })
-            os.remove(tmp_path)
+
+            import os as _os
+            _os.remove(tmp_path)
+
         except Exception as exc:
-            logger.warning("img2table failed or took too long: %s", exc)
+            logger.warning("img2table extraction failed (%s) — using coordinate heuristic", exc)
+            # Coordinate-based heuristic fallback
+            try:
+                if coordinates and len(coordinates) >= 4:
+                    sorted_coords = sorted(coordinates, key=lambda c: (c["y0"], c["x0"]))
+                    _rows: list[list[dict]] = []
+                    _cur: list[dict] = [sorted_coords[0]]
+                    for word in sorted_coords[1:]:
+                        if abs(word["y0"] - _cur[-1]["y0"]) < 30:
+                            _cur.append(word)
+                        else:
+                            _rows.append(_cur)
+                            _cur = [word]
+                    if _cur:
+                        _rows.append(_cur)
+                    if len(_rows) >= 3 and sum(1 for r in _rows if len(r) >= 3) >= 2:
+                        _hdrs = [w["text"] for w in _rows[0]]
+                        _data = []
+                        for row in _rows[1:]:
+                            cells = [w["text"] for w in row]
+                            while len(cells) < len(_hdrs):
+                                cells.append("")
+                            _data.append(dict(zip(_hdrs, cells[:len(_hdrs)])))
+                        if _data:
+                            tables_out.append({"headers": _hdrs, "rows": _data, "table_index": 0})
+            except Exception as exc2:
+                logger.warning("Heuristic table extraction also failed: %s", exc2)
 
         word_count = len(texts)
         avg_conf = sum(confidences) / max(1, len(confidences))
-        
+
         # Confidence gating logic
         confidence_warning = False
         reason = None
-        
+
         if avg_conf < self.ocr_confidence_threshold:
             confidence_warning = True
-            reason = f"Local OCR confidence {avg_conf:.1f}% < {self.ocr_confidence_threshold:.0f}% threshold — escalated to Groq VLM"
+            reason = f"Local OCR confidence {avg_conf:.1f}% < {self.ocr_confidence_threshold:.0f}% threshold — escalated to VLM"
         elif word_count < 3:
             confidence_warning = True
-            reason = f"OCR returned only {word_count} words (< 3) — escalated to Groq VLM"
+            reason = f"OCR returned only {word_count} words (< 3) — escalated to VLM"
 
         logger.info(
             "Path 1 OCR complete | words=%d | avg_confidence=%.1f%% | threshold=%.0f%%",
@@ -789,30 +880,43 @@ class SmartTriageOrchestrator:
             "_ocr_word_count"            : word_count,
         }
 
-    # ── Path 2: VLM (Groq Vision) ─────────────────────────────────────────────
 
-    def run_path_2_vlm(self, image_bgr: np.ndarray, temp_path: str) -> dict[str, Any]:
+    # ── Path 2: VLM ─────────────────────────────────────────────
+
+    def run_path_2_vlm(self, image_bgr: np.ndarray, temp_path: str, binarized_bgr: np.ndarray | None = None) -> dict[str, Any]:
         """
-        Path 2 — High-Complexity VLM via Groq Vision Engine (lego3 on port 8002).
-        Saves the preprocessed image to disk and calls the existing /extract endpoint.
+        Path 2 — High-Complexity VLM Engine (lego3 on port 8002).
+        Saves the original image to disk and optionally the binarized version,
+        then calls /extract with BOTH for dual-image extraction.
         """
-        # Save cleaned image to temp file for lego3 to read
+        # Save original image (color) for VLM
         clean_path = temp_path.replace(".jpg", "_smart_clean.jpg").replace(".png", "_smart_clean.png")
         if not clean_path.endswith("_smart_clean.jpg"):
             clean_path = temp_path + "_smart_clean.jpg"
         cv2.imwrite(clean_path, image_bgr)
 
+        # Save binarized image if provided
+        binarized_path = None
+        if binarized_bgr is not None:
+            binarized_path = clean_path.replace("_smart_clean.jpg", "_binarized.jpg")
+            cv2.imwrite(binarized_path, binarized_bgr)
+            logger.info("Saved binarized image for VLM: %s", binarized_path)
+
+        payload = {"image_path": clean_path}
+        if binarized_path:
+            payload["binarized_image_path"] = binarized_path
+
         try:
             resp = requests.post(
                 f"{self.lego3_url}/extract",
-                json={"image_path": clean_path},
+                json=payload,
                 timeout=180,
             )
             resp.raise_for_status()
             result = resp.json()
             return result.get("data", {})
         except Exception as exc:
-            logger.error("Groq VLM call failed: %s", exc)
+            logger.error("VLM call failed: %s", exc)
             return {
                 "extracted_text"    : "",
                 "key_value_pairs"   : {},
@@ -999,29 +1103,30 @@ class SmartTriageOrchestrator:
           Step 3: ALWAYS attempt CPU OCR first (pytesseract)
           Step 4: Check OCR confidence:
                    >= OCR_CONFIDENCE_THRESHOLD → Accept local result (Path 1, zero API cost)
-                   <  OCR_CONFIDENCE_THRESHOLD → Escalate to Groq Vision LLM (Path 2, fallback)
+                   <  OCR_CONFIDENCE_THRESHOLD → Escalate to VLM (Path 2, fallback)
         """
-        # Step 1: Pre-process the image
-        cleaned_bgr, downscaled_bgr = self.preprocess_image(image_bgr)
+        # Step 1: Pre-process the image (returns enhanced, original, binarized)
+        cleaned_bgr, original_downscaled_bgr, binarized_bgr = self.preprocess_image(image_bgr)
 
-        # Step 2: Calculate PCS (informational only)
+        # Save the ORIGINAL downscaled image for HITL preview
+        clean_path = os.path.join(self.lego2_temp_dir, f"{job_id}_clean.jpg")
+        cv2.imwrite(clean_path, original_downscaled_bgr)
+
+        # Step 2: Calculate PCS (informational only — run on enhanced image)
         pcs_result = self.calculate_pcs(cleaned_bgr)
         pcs_score  = pcs_result["pcs_score"]
-
-        # Save cleaned image for downstream use and HITL image preview
-        clean_path = os.path.join(self.lego2_temp_dir, f"{job_id}_clean.jpg")
-        cv2.imwrite(clean_path, cleaned_bgr)
 
         # Step 3: Always try local CPU OCR first
         logger.info(
             "[%s] Step 3: Attempting local CPU OCR first (PCS=%.4f, threshold=%.0f%%)",
             job_id, pcs_score, self.ocr_confidence_threshold,
         )
-        ocr_result = self.run_path_1_ocr(cleaned_bgr, downscaled_bgr)
+        ocr_result = self.run_path_1_ocr(binarized_bgr, original_downscaled_bgr)
+
         ocr_conf   = ocr_result.get("_ocr_avg_confidence", 0.0)
         no_ocr     = ocr_result.get("_path1_no_ocr", False)
-        
-        # Get extraction metrics
+
+
         word_count = ocr_result.get("_ocr_word_count", len(ocr_result.get("coordinates", [])))
         extracted_tables = ocr_result.get("tables", [])
 
@@ -1055,17 +1160,19 @@ class SmartTriageOrchestrator:
                 "_pipeline"     : "path_1_cpu_ocr",
             }
         else:
-            # ── PATH 2: Escalate to Groq VLM ────────────────────────────
+            # ── PATH 2: Escalate to VLM ────────────────────────────
             reason = (
                 f"PaddleOCR not installed"
                 if no_ocr
                 else f"Local OCR confidence {ocr_conf:.1f}% < {current_threshold:.1f}% threshold"
             )
             logger.info(
-                "[%s] → Path 2 ESCALATION: %s — calling Groq Vision LLM",
+                "[%s] → Path 2 ESCALATION: %s — calling VLM",
                 job_id, reason,
             )
-            vlm_result = self.run_path_2_vlm(cleaned_bgr, clean_path)
+            vlm_result = self.run_path_2_vlm(
+                original_downscaled_bgr, clean_path, binarized_bgr=binarized_bgr
+            )
             vlm_result["_source_image"]         = clean_path
             vlm_result["_ocr_avg_confidence"]   = ocr_conf
             vlm_result["_ocr_escalation_reason"] = reason
