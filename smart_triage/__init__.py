@@ -5,7 +5,7 @@ A high-efficiency document processing system implementing:
   - Track A:  Multi-engine Digital PDF detection (pypdf + pdfplumber + PyMuPDF)
               with printable-character-ratio gate → zero GPU/API cost
   - Track B / Path 1: CPU OCR via pytesseract (OCR confidence ≥ 80%)
-  - Track B / Path 2: Groq Vision LLM fallback (OCR confidence < 80%)
+  - Track B / Path 2: Qwen 3.6 27B Vision LLM fallback (OCR confidence < 80%)
   - Unified Docling-schema AST output
 """
 from smart_triage.orchestrator import (

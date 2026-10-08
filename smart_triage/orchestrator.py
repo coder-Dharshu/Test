@@ -18,6 +18,10 @@ PCS Formula (§2.2) — used for display only:
 """
 
 import os
+os.environ["FLAGS_use_mkldnn"] = "0"
+os.environ["FLAGS_enable_pir_api"] = "0"
+os.environ["PADDLE_USE_PIR_API"] = "0"
+
 import io
 import uuid
 import json
@@ -74,19 +78,43 @@ except ImportError:
 # OCR engine: PaddleOCR
 try:
     import paddleocr
-    PADDLE_AVAILABLE = True
+    PADDLE_AVAILABLE = False # Force false due to Windows segfault
 except ImportError:
     PADDLE_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
+# ── New production OCR engine (Phase 3 integration) ─────────────────────────
+try:
+    from smart_triage.ocr_engine import (
+        MultiStrategyOCREngine,
+        LocalTextDensityClassifier,
+        DocumentTypeClassifier,
+        PreprocessingStrategy,
+    )
+    OCR_ENGINE_AVAILABLE = True
+except ImportError:
+    try:
+        from ocr_engine import (
+            MultiStrategyOCREngine,
+            LocalTextDensityClassifier,
+            DocumentTypeClassifier,
+            PreprocessingStrategy,
+        )
+        OCR_ENGINE_AVAILABLE = True
+    except ImportError:
+        OCR_ENGINE_AVAILABLE = False
+        logger.warning("ocr_engine.py not found — advanced OCR pipeline disabled.")
+
 # ---------------------------------------------------------------------------
 # Execution path enum
 # ---------------------------------------------------------------------------
 class ExecutionPath(str, Enum):
-    TRACK_A_DIGITAL          = "TRACK_A"
-    PATH_1_LOW_COMPLEXITY    = "PATH_1"
-    PATH_2_HIGH_COMPLEXITY   = "PATH_2"
+    TRACK_A_DIGITAL          = "TRACK_A"        # vector-native digital PDF
+    PATH_1_LOW_COMPLEXITY    = "PATH_1"         # scanned image — local OCR accepted
+    PATH_2_HIGH_COMPLEXITY   = "PATH_2"         # scanned image — VLM escalation
+    TRACK_B_LOCAL            = "TRACK_B_LOCAL"  # image-only PDF — all pages local render+OCR
+    TRACK_C_VLM              = "TRACK_C"        # VLM-first fallback (last resort)
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +145,16 @@ OCR_CONFIDENCE_THRESHOLD = 80.0  # percent (0–100)
 #   • Contour count proxy for character density     (weight 0.25)
 IMAGE_ROUTER_TEXT_THRESHOLD = float(os.environ.get("IMAGE_ROUTER_TEXT_THRESHOLD", "0.12"))
 
+# ---------------------------------------------------------------------------
+# TRACK_B_LOCAL — OCR Quality Thresholds
+# ---------------------------------------------------------------------------
+# Per-page OCR output must satisfy ALL three thresholds to be accepted locally.
+# If any threshold fails AND PaddleOCR is unavailable, the page escalates to VLM.
+# Using "≥1 word" is insufficient — bad OCR can return single junk characters.
+TRACK_B_LOCAL_MIN_WORDS = int(os.environ.get("TRACK_B_LOCAL_MIN_WORDS", "10"))   # min recognised words
+TRACK_B_LOCAL_MIN_CHARS = int(os.environ.get("TRACK_B_LOCAL_MIN_CHARS", "40"))   # min character count
+TRACK_B_LOCAL_MIN_CONF  = float(os.environ.get("TRACK_B_LOCAL_MIN_CONF",  "50.0"))  # min avg confidence %
+
 
 # ---------------------------------------------------------------------------
 # SmartTriageOrchestrator
@@ -136,20 +174,37 @@ class SmartTriageOrchestrator:
     ):
         self.pcs_threshold            = pcs_threshold
         self.ocr_confidence_threshold = ocr_confidence_threshold
-        self.lego3_url = os.environ.get("LEGO3_VLM_URL", "http://localhost:8002/api/v1")
+        # RC-1 fix: the Qwen engine's endpoints are /extract and /route (no /api/v1 prefix).
+        # Previously this was "http://localhost:8002/api/v1" which caused 404 on every call.
+        self.lego3_url = os.environ.get("LEGO3_VLM_URL", "http://localhost:8002")
         self.easyocr_reader = None
         self.lego2_temp_dir           = lego2_temp_dir
         os.makedirs(lego2_temp_dir, exist_ok=True)
-        
+
         # Initialize persistent OCR engines to prevent timeout bottlenecks
         if PADDLE_AVAILABLE:
             from paddleocr import PaddleOCR
             from img2table.ocr import PaddleOCR as Img2TablePaddleOCR
-            self.paddle_ocr_engine = PaddleOCR(use_angle_cls=True, lang='en', det_limit_side_len=1600, det_db_thresh=0.3, det_db_box_thresh=0.5)
+            self.paddle_ocr_engine = PaddleOCR(use_angle_cls=True, lang='en', det_limit_side_len=1600, det_db_thresh=0.3, det_db_box_thresh=0.5, enable_mkldnn=False)
             self.img2table_ocr_wrapper = Img2TablePaddleOCR(lang="en")
         else:
             self.paddle_ocr_engine = None
             self.img2table_ocr_wrapper = None
+
+        # ── New production OCR engine ─────────────────────────────────────
+        if OCR_ENGINE_AVAILABLE:
+            self._multi_ocr_engine = MultiStrategyOCREngine(
+                confidence_threshold=ocr_confidence_threshold,
+                min_meaningful_words=3,
+                easyocr_reader=self.easyocr_reader,
+            )
+            self._text_density_clf = LocalTextDensityClassifier()
+            self._doc_type_clf     = DocumentTypeClassifier()
+            logger.info("MultiStrategyOCREngine + LocalTextDensityClassifier loaded.")
+        else:
+            self._multi_ocr_engine = None
+            self._text_density_clf = None
+            self._doc_type_clf     = None
 
         logger.info(
             "SmartTriageOrchestrator ready | OCR confidence gate=%.0f%% | pdfium=%s | paddle=%s | img_router_threshold=%.2f",
@@ -443,7 +498,15 @@ class SmartTriageOrchestrator:
     def _extract_with_pandas(self, file_path: str, is_csv: bool = False) -> list[dict]:
         """
         Track A extractor for tabular files (Excel, CSV) using pandas.
-        Every sheet (or the single CSV) is treated as a 'page' containing one massive table.
+
+        Every sheet (or the single CSV) is treated as a 'page' containing one
+        table element. Each page dict now carries rich sheet metadata:
+          - sheet_name: original worksheet name
+          - row_count: number of data rows
+          - col_count: number of columns
+          - is_empty: True when the sheet has no data rows
+
+        These fields power the multi-sheet selector UI in the HITL dashboard.
         """
         pages_out = []
         if not PANDAS_AVAILABLE:
@@ -455,35 +518,51 @@ class SmartTriageOrchestrator:
                 df = pd.read_csv(file_path, dtype=str).fillna("")
                 dfs = {"Sheet1": df}
             else:
+                # sheet_name=None reads ALL worksheets into an OrderedDict
                 dfs = pd.read_excel(file_path, sheet_name=None, dtype=str)
                 for k in dfs:
                     dfs[k] = dfs[k].fillna("")
 
             page_num = 1
             for sheet_name, df in dfs.items():
-                headers = list(df.columns)
-                rows = []
-                for _, row_data in df.iterrows():
-                    rows.append({str(k): str(v) for k, v in row_data.items()})
+                headers    = [str(h) for h in df.columns]
+                row_count  = len(df)
+                col_count  = len(df.columns)
+                is_empty   = row_count == 0
+
+                rows = [
+                    {str(k): str(v) for k, v in row_data.items()}
+                    for _, row_data in df.iterrows()
+                ]
 
                 table = {
-                    "headers": [str(h) for h in headers],
-                    "rows": rows,
-                    "table_index": 0
+                    "headers"    : headers,
+                    "rows"       : rows,
+                    "table_index": 0,
+                    "sheet_name" : sheet_name,
                 }
 
                 pages_out.append({
-                    "page_number": page_num,
-                    "extracted_text": f"Sheet: {sheet_name}",
-                    "coordinates": [],
-                    "tables": [table],
-                    "key_value_pairs": {},
-                    "handwriting_detected": False,
-                    "confidence_warning": False,
+                    "page_number"              : page_num,
+                    "sheet_name"               : sheet_name,        # NEW: for UI selector
+                    "row_count"                : row_count,          # NEW: sheet stats
+                    "col_count"                : col_count,          # NEW: sheet stats
+                    "is_empty"                 : is_empty,           # NEW: empty-sheet flag
+                    "extracted_text"           : f"Sheet: {sheet_name} ({row_count} rows × {col_count} cols)",
+                    "coordinates"              : [],
+                    "tables"                   : [] if is_empty else [table],
+                    "key_value_pairs"          : {},
+                    "handwriting_detected"     : False,
+                    "confidence_warning"       : False,
                     "confidence_warning_reason": None,
-                    "_engine": "pandas"
+                    "_engine"                  : "pandas",
                 })
                 page_num += 1
+
+                logger.info(
+                    "Sheet '%s': %d rows × %d cols (empty=%s)",
+                    sheet_name, row_count, col_count, is_empty,
+                )
 
         except Exception as exc:
             logger.warning("pandas extraction failed on %s: %s", file_path, exc)
@@ -504,11 +583,13 @@ class SmartTriageOrchestrator:
           3. For each <w:tbl> table, collect cell text into the text stream
              AND build a structured table dict for the 'tables' field.
           4. This guarantees document order is preserved across the entire doc.
+          5. If python-docx fails, falls back to mammoth (HTML-based extraction)
+             which handles corrupted, protected, and non-standard .docx files.
         """
         pages_out = []
         if not DOCX_AVAILABLE:
-            logger.warning("python-docx is not available. Cannot process %s natively.", file_path)
-            return pages_out
+            logger.warning("python-docx is not available. Trying mammoth fallback for %s.", file_path)
+            return self._extract_with_mammoth(file_path, primary_error="python-docx not installed")
 
         try:
             from docx.oxml.ns import qn
@@ -578,16 +659,79 @@ class SmartTriageOrchestrator:
             })
 
         except Exception as exc:
-            logger.warning("python-docx extraction failed on %s: %s", file_path, exc)
+            logger.warning("python-docx extraction failed on %s: %s — trying mammoth fallback", file_path, exc)
+            pages_out = self._extract_with_mammoth(file_path, primary_error=str(exc))
 
         return pages_out
 
+    def _extract_with_mammoth(self, file_path: str, primary_error: str = "") -> list[dict]:
+        """
+        Mammoth fallback extractor for .docx files that python-docx cannot parse.
+        Mammoth converts .docx to clean HTML then strips tags for plain text.
+        Much more tolerant of non-standard/protected/complex Word documents.
+        """
+        try:
+            import mammoth
+            import re as _re
+
+            with open(file_path, "rb") as fh:
+                result = mammoth.convert_to_html(fh)
+
+            html = result.value or ""
+            warnings = result.messages
+            if warnings:
+                logger.info("mammoth warnings for %s: %s", file_path, [str(w) for w in warnings])
+
+            # Strip HTML tags to get plain text
+            plain = _re.sub(r"<[^>]+>", " ", html)
+            plain = _re.sub(r"[ \t]+", " ", plain)
+            plain = _re.sub(r"\n{3,}", "\n\n", plain).strip()
+
+            if not plain:
+                logger.warning("mammoth returned empty text for %s", file_path)
+                return []
+
+            logger.info(
+                "mammoth fallback succeeded for %s: %d chars extracted",
+                file_path, len(plain),
+            )
+
+            note = ""
+            if primary_error:
+                note = (
+                    f"\n\n[Note: python-docx failed ({primary_error}). "
+                    "Extracted via mammoth — formatting may differ from original.]"
+                )
+
+            return [{
+                "page_number"              : 1,
+                "extracted_text"           : plain + note,
+                "coordinates"              : [],
+                "tables"                   : [],
+                "key_value_pairs"          : {},
+                "handwriting_detected"     : False,
+                "confidence_warning"       : bool(primary_error),
+                "confidence_warning_reason": (
+                    f"Extracted via mammoth fallback (primary engine failed: {primary_error})"
+                    if primary_error else None
+                ),
+                "_engine"                  : "mammoth-html-fallback",
+            }]
+
+        except ImportError:
+            logger.error(
+                "mammoth is not installed — cannot extract %s. Run: pip install mammoth", file_path
+            )
+            return []
+        except Exception as exc:
+            logger.error("mammoth fallback also failed for %s: %s", file_path, exc)
+            return []
 
     # ── VLM Image Router — text_document vs general_photo ───────────────────
 
     def classify_and_route_image(self, file_path: str) -> dict:
         """
-        Calls the Lego 3 Groq VLM router endpoint to determine if the image
+        Calls the Lego 3 Qwen 3.6 27B VLM router endpoint to determine if the image
         is a TEXT_DOCUMENT or GENERAL_IMAGE using semantic understanding.
         """
         try:
@@ -879,7 +1023,9 @@ class SmartTriageOrchestrator:
     def run_path_2_vlm(self, image_bgr: np.ndarray, temp_path: str) -> dict[str, Any]:
         """
         Path 2 — High-Complexity VLM Engine (lego3 on port 8002).
-        Saves the preprocessed image to disk and calls the existing /extract endpoint.
+        Saves the preprocessed image to disk and calls the /extract endpoint.
+
+        On failure: falls back to local PaddleOCR — never returns empty text.
         """
         # Save cleaned image to temp file for lego3 to read
         clean_path = temp_path.replace(".jpg", "_smart_clean.jpg").replace(".png", "_smart_clean.png")
@@ -887,24 +1033,50 @@ class SmartTriageOrchestrator:
             clean_path = temp_path + "_smart_clean.jpg"
         cv2.imwrite(clean_path, image_bgr)
 
+        vlm_endpoint = f"{self.lego3_url}/extract"
+        logger.info("VLM endpoint used: %s", vlm_endpoint)
+
         try:
             resp = requests.post(
-                f"{self.lego3_url}/extract",
+                vlm_endpoint,
                 json={"image_path": clean_path},
                 timeout=180,
             )
             resp.raise_for_status()
             result = resp.json()
             return result.get("data", {})
+
         except Exception as exc:
-            logger.error("VLM call failed: %s", exc)
+            logger.error(
+                "VLM call failed (%s) — OCR fallback activated", exc,
+            )
+            logger.info("OCR fallback activated: running local PaddleOCR on saved image")
+
+            # RC-3 fix: never discard the page — fall back to local PaddleOCR
+            if self.paddle_ocr_engine is not None:
+                try:
+                    fallback = self.run_path_1_ocr(image_bgr, image_bgr)
+                    fallback["confidence_warning"]        = True
+                    fallback["confidence_warning_reason"] = (
+                        f"VLM API error ({exc}) — fell back to local OCR"
+                    )
+                    logger.info(
+                        "OCR fallback succeeded: words=%d conf=%.1f%%",
+                        fallback.get("_ocr_word_count", 0),
+                        fallback.get("_ocr_avg_confidence", 0.0),
+                    )
+                    return fallback
+                except Exception as ocr_exc:
+                    logger.error("OCR fallback also failed: %s", ocr_exc)
+
+            # Absolute last resort — return a non-empty error marker (never silent empty)
             return {
-                "extracted_text"    : "",
-                "key_value_pairs"   : {},
-                "tables"            : [],
-                "handwriting_detected"   : False,
-                "confidence_warning"     : True,
-                "confidence_warning_reason": f"VLM API error: {exc}",
+                "extracted_text"           : "[VLM and OCR both unavailable — manual review required]",
+                "key_value_pairs"          : {},
+                "tables"                   : [],
+                "handwriting_detected"     : False,
+                "confidence_warning"       : True,
+                "confidence_warning_reason": f"VLM API error: {exc} — no OCR engine available",
             }
 
     # ── PDF → Image Rendering ─────────────────────────────────────────────────
@@ -942,6 +1114,286 @@ class SmartTriageOrchestrator:
 
         return None
 
+    # ── PDF Type Detection ───────────────────────────────────────────────────
+
+    def _count_pdf_pages(self, pdf_path: str) -> int:
+        """Return total page count of a PDF. Tries PyMuPDF then pypdf."""
+        if PYMUPDF_AVAILABLE:
+            try:
+                import fitz
+                return len(fitz.open(pdf_path))
+            except Exception:
+                pass
+        try:
+            return len(PdfReader(pdf_path).pages)
+        except Exception:
+            return 1
+
+    def _detect_pdf_type(self, pdf_path: str, job_id: str) -> dict:
+        """
+        Classify a PDF into one of three types for routing:
+          • has_text_layer:  ≥50 printable chars detected — route TRACK_A
+          • is_image_only:   0 text chars — route TRACK_B_LOCAL (all pages render+OCR)
+          • mixed:           some text + embedded images — route TRACK_B (existing)
+
+        Emits a structured log line with all decision signals.
+        """
+        page_count  = self._count_pdf_pages(pdf_path)
+        has_embedded = False
+
+        # ── Text check via pdfplumber ────────────────────────────────────────
+        plumber_data = self._extract_with_pdfplumber(pdf_path)
+        all_text     = plumber_data.get("extracted_text", "")
+        total_chars  = len(all_text.strip())
+        print_ratio  = self._printable_ratio(all_text)
+        has_text     = (total_chars >= self.MIN_TEXT_CHARS) and (print_ratio >= self.MIN_PRINTABLE_RATIO)
+
+        # ── Embedded raster image check via PyMuPDF ──────────────────────────
+        if PYMUPDF_AVAILABLE:
+            try:
+                import fitz
+                doc = fitz.open(pdf_path)
+                for i in range(len(doc)):
+                    if doc[i].get_images(full=True):
+                        has_embedded = True
+                        break
+            except Exception as exc:
+                logger.warning("[%s] _detect_pdf_type: image check failed: %s", job_id, exc)
+
+        is_image_only = not has_text
+        is_mixed      = has_text and has_embedded
+
+        pdf_type = (
+            "digital"    if has_text and not is_mixed
+            else "mixed" if is_mixed
+            else "image_only"
+        )
+
+        logger.info(
+            "[%s] PDF type detected | pdf_type=%s | text_layer=%s | image_only=%s | "
+            "mixed=%s | pages=%d | total_chars=%d | printable_ratio=%.2f | embedded_images=%s",
+            job_id, pdf_type, has_text, is_image_only, is_mixed,
+            page_count, total_chars, print_ratio, has_embedded,
+        )
+
+        return {
+            "has_text_layer"     : has_text,
+            "is_image_only"      : is_image_only,
+            "is_mixed"           : is_mixed,
+            "page_count"         : page_count,
+            "total_chars"        : total_chars,
+            "printable_ratio"    : print_ratio,
+            "has_embedded_images": has_embedded,
+        }
+
+    # ── TRACK_B_LOCAL: Image-only PDF full local pipeline ────────────────────
+
+    def _run_image_only_pdf(self, pdf_path: str, job_id: str, page_count: int) -> dict[str, Any]:
+        """
+        TRACK_B_LOCAL — All pages rendered locally; OCR + layout + image extraction.
+
+        Per-page pipeline:
+          1. render_pdf_page_to_image  → high-res BGR (priority over embedded imgs)
+          2. Save rendered image to lego2_temp/ for HITL visual preview
+          3. preprocess_image          → deskew + binarize
+          4. run_path_1_ocr            → PaddleOCR
+          5. Quality gate:
+               word_count >= TRACK_B_LOCAL_MIN_WORDS AND
+               char_count >= TRACK_B_LOCAL_MIN_CHARS AND
+               avg_conf   >= TRACK_B_LOCAL_MIN_CONF
+             → Accept local (no VLM)
+             → Fail gate: escalate page to VLM (last resort only)
+          6. Extract embedded raster images for HITL gallery
+
+        VLM is never called unless step 5 fails AND PaddleOCR is unavailable.
+        On VLM failure the result is merged with best local OCR — never empty.
+        """
+        pages_out      : list[dict] = []
+        total_elements : int        = 0
+
+        for page_idx in range(page_count):
+            logger.info(
+                "[%s] TRACK_B_LOCAL | rendering page %d/%d",
+                job_id, page_idx + 1, page_count,
+            )
+
+            # ── Step 1: Render ──────────────────────────────────────────────
+            image_bgr = self.render_pdf_page_to_image(pdf_path, page_index=page_idx)
+            if image_bgr is None:
+                logger.warning(
+                    "[%s] TRACK_B_LOCAL | page %d render failed — skipping",
+                    job_id, page_idx + 1,
+                )
+                pages_out.append(self._empty_page(page_idx + 1, "render_failed"))
+                continue
+
+            # ── Step 2: Save rendered image for HITL preview ───────────────
+            preview_filename = f"{job_id}_p{page_idx + 1}_render.jpg"
+            preview_path     = os.path.join(self.lego2_temp_dir, preview_filename)
+            cv2.imwrite(preview_path, image_bgr)
+            logger.info(
+                "[%s] TRACK_B_LOCAL | page %d rendered → %s",
+                job_id, page_idx + 1, preview_path,
+            )
+
+            # ── Step 3: Preprocess ──────────────────────────────────────────
+            cleaned_bgr, downscaled_bgr = self.preprocess_image(image_bgr)
+
+            # ── Step 4: Local OCR ───────────────────────────────────────────
+            logger.info(
+                "[%s] TRACK_B_LOCAL | page %d — running local PaddleOCR",
+                job_id, page_idx + 1,
+            )
+            ocr_result = self.run_path_1_ocr(cleaned_bgr, downscaled_bgr)
+            word_count = ocr_result.get("_ocr_word_count", len(ocr_result.get("coordinates", [])))
+            avg_conf   = ocr_result.get("_ocr_avg_confidence", 0.0)
+            char_count = len(ocr_result.get("extracted_text", "").strip())
+            no_ocr_eng = ocr_result.get("_path1_no_ocr", False)
+
+            # ── Step 5: Quality gate ────────────────────────────────────────
+            quality_ok = (
+                not no_ocr_eng
+                and word_count >= TRACK_B_LOCAL_MIN_WORDS
+                and char_count >= TRACK_B_LOCAL_MIN_CHARS
+                and avg_conf   >= TRACK_B_LOCAL_MIN_CONF
+            )
+
+            if quality_ok:
+                logger.info(
+                    "[%s] TRACK_B_LOCAL | page %d OCR accepted locally "
+                    "(words=%d chars=%d conf=%.1f%%) — VLM not called",
+                    job_id, page_idx + 1, word_count, char_count, avg_conf,
+                )
+                page_dict = {
+                    **ocr_result,
+                    "page_number"              : page_idx + 1,
+                    "_source_image"            : preview_path,
+                    "_engine"                  : "paddle_ocr_local",
+                    "confidence_warning"       : False,
+                    "confidence_warning_reason": None,
+                }
+
+            else:
+                # VLM escalation — true last resort
+                reason = (
+                    "PaddleOCR not installed"
+                    if no_ocr_eng
+                    else (
+                        f"OCR quality below threshold "
+                        f"(words={word_count}<{TRACK_B_LOCAL_MIN_WORDS} OR "
+                        f"chars={char_count}<{TRACK_B_LOCAL_MIN_CHARS} OR "
+                        f"conf={avg_conf:.1f}%<{TRACK_B_LOCAL_MIN_CONF}%)"
+                    )
+                )
+                logger.info(
+                    "[%s] TRACK_B_LOCAL | page %d OCR quality insufficient (%s) "
+                    "— escalating page to VLM (TRACK_C). OCR fallback activated.",
+                    job_id, page_idx + 1, reason,
+                )
+                logger.info(
+                    "[%s] VLM endpoint used: %s/extract | page %d",
+                    job_id, self.lego3_url, page_idx + 1,
+                )
+                vlm_result = self.run_path_2_vlm(cleaned_bgr, preview_path)
+
+                # Merge: VLM empty → fall back to best OCR result
+                if not vlm_result.get("extracted_text", "").strip() and ocr_result.get("extracted_text", "").strip():
+                    logger.warning(
+                        "[%s] VLM returned empty text for page %d — "
+                        "merging best local OCR result. OCR fallback activated.",
+                        job_id, page_idx + 1,
+                    )
+                    vlm_result["extracted_text"]          = ocr_result["extracted_text"]
+                    vlm_result["key_value_pairs"]          = ocr_result.get("key_value_pairs", {})
+                    vlm_result["confidence_warning"]       = True
+                    vlm_result["confidence_warning_reason"] = f"VLM failed ({reason}) — merged local OCR"
+
+                page_dict = {
+                    **vlm_result,
+                    "page_number"  : page_idx + 1,
+                    "_source_image": preview_path,
+                    "_engine"      : "vlm_fallback",
+                }
+
+            # ── Step 6: Extract embedded raster images for HITL gallery ────
+            images_out: list[dict] = []
+            if PYMUPDF_AVAILABLE:
+                try:
+                    import fitz
+                    doc  = fitz.open(pdf_path)
+                    page = doc[page_idx]
+                    for img_idx, img in enumerate(page.get_images(full=True)):
+                        xref       = img[0]
+                        base_image = doc.extract_image(xref)
+                        if not base_image:
+                            continue
+                        img_filename = (
+                            f"{job_id}_p{page_idx + 1}_img{img_idx}_"
+                            f"{str(uuid.uuid4())[:4]}.{base_image['ext']}"
+                        )
+                        img_path = os.path.join(self.lego2_temp_dir, img_filename)
+                        with open(img_path, "wb") as fh:
+                            fh.write(base_image["image"])
+                        images_out.append({
+                            "image_id": f"img_{xref}",
+                            "filename" : img_filename,
+                            "path"     : img_path,
+                            "width"    : base_image["width"],
+                            "height"   : base_image["height"],
+                        })
+                except Exception as exc:
+                    logger.warning(
+                        "[%s] TRACK_B_LOCAL | page %d image extraction failed: %s",
+                        job_id, page_idx + 1, exc,
+                    )
+
+            page_dict["images"] = images_out
+
+            elements_count = (
+                (1 if page_dict.get("extracted_text", "").strip() else 0)
+                + len(page_dict.get("tables", []))
+                + len(images_out)
+            )
+            total_elements += elements_count
+
+            logger.info(
+                "[%s] TRACK_B_LOCAL | page %d complete | "
+                "elements_extracted=%d (text=%s tables=%d images=%d)",
+                job_id, page_idx + 1, elements_count,
+                bool(page_dict.get("extracted_text", "").strip()),
+                len(page_dict.get("tables", [])),
+                len(images_out),
+            )
+            pages_out.append(page_dict)
+
+        logger.info(
+            "[%s] TRACK_B_LOCAL complete | pages_rendered=%d | total_elements=%d",
+            job_id, page_count, total_elements,
+        )
+        return {
+            "job_id"        : job_id,
+            "execution_path": ExecutionPath.TRACK_B_LOCAL.value,
+            "pcs_score"     : 0.0,
+            "pcs_breakdown" : None,
+            "pages"         : pages_out,
+            "_pipeline"     : "track_b_local_ocr",
+        }
+
+    def _empty_page(self, page_number: int, reason: str) -> dict:
+        """Return a well-formed empty page dict for error/skip cases."""
+        return {
+            "page_number"              : page_number,
+            "extracted_text"           : "",
+            "coordinates"              : [],
+            "tables"                   : [],
+            "key_value_pairs"          : {},
+            "handwriting_detected"     : False,
+            "confidence_warning"       : True,
+            "confidence_warning_reason": reason,
+            "_engine"                  : "error",
+            "images"                   : [],
+        }
+
     # ── Master Route Entry Point ──────────────────────────────────────────────
 
     def route_document(
@@ -966,11 +1418,18 @@ class SmartTriageOrchestrator:
         ext = Path(file_path).suffix.lower()
         logger.info("[%s] Routing: %s (ext=%s)", job_id, file_path, ext)
 
-        # ── TRACK A: Digital PDF ─────────────────────────────────────────
+        # ── PDF Routing: TRACK_A / TRACK_B_LOCAL / TRACK_B ───────────────
         if ext == ".pdf":
-            is_native, pages_data = self.is_vector_native(file_path, job_id)
-            if is_native:
-                logger.info("[%s] → Track A: Digital Fast-Path (%d pages)", job_id, len(pages_data))
+            pdf_info   = self._detect_pdf_type(file_path, job_id)
+            page_count = pdf_info["page_count"]
+
+            if pdf_info["has_text_layer"]:
+                # ── TRACK A: vector-native digital PDF ───────────────────
+                logger.info(
+                    "[%s] → TRACK_A: Digital Fast-Path | text_layer=True | pages=%d | chars=%d",
+                    job_id, page_count, pdf_info["total_chars"],
+                )
+                _, pages_data = self.is_vector_native(file_path, job_id)
                 return {
                     "job_id"        : job_id,
                     "execution_path": ExecutionPath.TRACK_A_DIGITAL.value,
@@ -979,12 +1438,29 @@ class SmartTriageOrchestrator:
                     "pages"         : pages_data,
                     "_pipeline"     : "track_a_digital",
                 }
+
+            elif pdf_info["is_image_only"]:
+                # ── TRACK_B_LOCAL: image-only PDF, all pages rendered locally ─
+                logger.info(
+                    "[%s] → TRACK_B_LOCAL: Image-only PDF | text_layer=False | "
+                    "pages=%d | embedded_images=%s | escalation_reason=no_text_layer",
+                    job_id, page_count, pdf_info["has_embedded_images"],
+                )
+                return self._run_image_only_pdf(file_path, job_id, page_count)
+
             else:
-                logger.info("[%s] PDF is scanned/blank — proceeding to Track B rendering", job_id)
-                # Render first page to image for complexity analysis
+                # ── TRACK_B: mixed PDF — render first page, existing pipeline ─
+                logger.info(
+                    "[%s] → TRACK_B: Mixed PDF | text_layer=True+images | pages=%d",
+                    job_id, page_count,
+                )
                 image_bgr = self.render_pdf_page_to_image(file_path, page_index=0)
                 if image_bgr is None:
-                    logger.warning("[%s] Could not render PDF page — falling back to VLM", job_id)
+                    logger.warning(
+                        "[%s] Could not render mixed PDF page 0 — escalating to TRACK_C (VLM). "
+                        "VLM endpoint used: %s/extract",
+                        job_id, self.lego3_url,
+                    )
                     return self._run_vlm_on_file(file_path, job_id, pcs_score=1.0, pcs_breakdown=None)
                 return self._run_track_b(image_bgr, file_path, job_id)
 
@@ -1074,184 +1550,156 @@ class SmartTriageOrchestrator:
                 "_pipeline"     : "error_unreadable",
             }
 
-        # ── IMAGE ROUTER — VLM Classification ────────────
-        classification = self.classify_and_route_image(file_path)
-        route_type = classification.get("type", "general_image")
-        
+        # Convert image to black and white (Otsu threshold) before extraction
+        gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+        _, bw_image = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+        image_bgr = cv2.cvtColor(bw_image, cv2.COLOR_GRAY2BGR)
+
+        return self._run_track_b(image_bgr, file_path, job_id)
+
+    def _run_track_b(self, image_bgr: np.ndarray, file_path: str, job_id: str) -> dict[str, Any]:
+        """
+        7-STAGE CONFIDENCE PIPELINE (replaces single VLM shot and old PATH 1/2 routing)
+        """
+        import time as _time
+        pipeline_start = _time.perf_counter()
+
+        text_density_score = 0.0
+        density_signals: dict = {}
+        local_classification = "ambiguous"
+
+        # ── Stage 1: Local text density pre-screen ──────────────────────
+        t1 = _time.perf_counter()
+        if self._text_density_clf is not None:
+            text_density_score, density_signals = self._text_density_clf.score(image_bgr)
+            local_classification = self._text_density_clf.classify(image_bgr)
+            logger.info(
+                "[%s] Stage1 TextDensity: score=%.4f class=%s (%.1fms)",
+                job_id, text_density_score, local_classification,
+                (_time.perf_counter() - t1) * 1000,
+            )
+        else:
+            logger.info("[%s] Stage1: OCR engine not available — skipping density pre-screen.", job_id)
+
+        # ── Stage 2: Fast local OCR when image looks text-heavy ─────────
+        local_ocr_result = None
+        t2 = _time.perf_counter()
+        if local_classification in ("text_document", "ambiguous") and self._multi_ocr_engine is not None:
+            local_ocr_result = self._multi_ocr_engine.run(image_bgr)
+            logger.info(
+                "[%s] Stage2 LocalOCR: conf=%.1f%% words=%d engine=%s (%.1fms)",
+                job_id, local_ocr_result.confidence, local_ocr_result.word_count,
+                local_ocr_result.engine, (_time.perf_counter() - t2) * 1000,
+            )
+
+        # ── Decision: can we skip VLM entirely? ─────────────────────────
+        LOCAL_SKIP_THRESHOLD = 55.0   # confidence % to skip VLM entirely
+        LOCAL_SKIP_MIN_WORDS = 5
+
+        vlm_skipped = False
+        if (
+            local_ocr_result is not None
+            and local_ocr_result.confidence >= LOCAL_SKIP_THRESHOLD
+            and local_ocr_result.word_count >= LOCAL_SKIP_MIN_WORDS
+        ):
+            logger.info(
+                "[%s] Stage2→Skip: Local OCR confident (%.1f%%, %d words) — VLM router skipped.",
+                job_id, local_ocr_result.confidence, local_ocr_result.word_count,
+            )
+            vlm_skipped = True
+            route_type = "text_document"
+            classification = {"type": "text_document", "text": local_ocr_result.text}
+        elif local_classification == "general_image" and text_density_score <= 0.03:
+            logger.info(
+                "[%s] Stage1→Skip: Very low text density (%.4f) — classifying as general_image without VLM.",
+                job_id, text_density_score,
+            )
+            vlm_skipped = True
+            route_type = "general_image"
+            classification = {"type": "general_image", "detected_text": ""}
+        else:
+            # ── Stage 3: VLM Classification (ambiguous images only) ──────
+            t3 = _time.perf_counter()
+            classification = self.classify_and_route_image(file_path)
+            route_type = classification.get("type", "general_image")
+            logger.info(
+                "[%s] Stage3 VLMRouter: type=%s (%.1fms)",
+                job_id, route_type, (_time.perf_counter() - t3) * 1000,
+            )
+
+            # ── Stage 4: VLM override by local OCR ──────────────────────
+            if (
+                route_type == "general_image"
+                and local_ocr_result is not None
+                and local_ocr_result.confidence >= 45.0
+                and local_ocr_result.word_count >= 8
+            ):
+                logger.info(
+                    "[%s] Stage4 Override: VLM said general_image but OCR found %d words (%.1f%% conf) — reclassifying as text_document.",
+                    job_id, local_ocr_result.word_count, local_ocr_result.confidence,
+                )
+                route_type = "text_document"
+                classification = {"type": "text_document", "text": local_ocr_result.text}
+
+        total_pipeline_ms = (_time.perf_counter() - pipeline_start) * 1000
         logger.info(
-            "[%s] VLM Image classification → type=%s",
-            job_id, route_type,
+            "[%s] Classification pipeline complete: type=%s density=%.4f vlm_skipped=%s total=%.1fms",
+            job_id, route_type, text_density_score, vlm_skipped, total_pipeline_ms,
         )
 
-        if route_type == "general_image":
-            # General photo: VLM decided it's mostly visual content.
-            # It may also contain 'detected_text'.
-            logger.info(
-                "[%s] → General Photo detected — returning image unchanged",
-                job_id,
-            )
-            detected_text = classification.get("detected_text", "")
-            
-            if not detected_text.strip():
-                logger.info("[%s] VLM returned no text. Using local OCR library (EasyOCR) to extract incidental text...", job_id)
-                try:
-                    import easyocr
-                    if self.easyocr_reader is None:
-                        # Lazy initialization of EasyOCR to save startup time
-                        self.easyocr_reader = easyocr.Reader(['en'], gpu=False)
-                    res = self.easyocr_reader.readtext(file_path, detail=0)
-                    if res:
-                        detected_text = " ".join(res)
-                        logger.info("[%s] Local EasyOCR extracted %d characters from general image.", job_id, len(detected_text))
-                except Exception as e:
-                    logger.warning("Local EasyOCR fallback failed: %s", e)
+        # ── Stage 5: Ensure OCR is run if no text was extracted ─────────
+        if self._multi_ocr_engine is not None and local_ocr_result is None:
+            logger.info("[%s] Stage5: Forcing multi-strategy OCR extraction.", job_id)
+            local_ocr_result = self._multi_ocr_engine.run(image_bgr)
 
-            return {
-                "job_id"          : job_id,
-                "execution_path"  : "GENERAL_PHOTO",
-                "pcs_score"       : 0.0,
-                "pcs_breakdown"   : None,
-                "image_type"      : "general_image",
-                "image_path"      : file_path,
-                "classification"  : {"image_type": "general_image", "text_score": 0.0, "signals": {}},
-                "pages"           : [{
-                    "page_number"               : 1,
-                    "image_type"                : "general_image",
-                    "image_path"                : file_path,
-                    "_source_image"             : file_path,
-                    "extracted_text"            : detected_text,
-                    "key_value_pairs"           : {},
-                    "tables"                    : [],
-                    "coordinates"               : [],
-                    "handwriting_detected"      : False,
-                    "confidence_warning"        : False,
-                    "confidence_warning_reason" : None,
-                    "elements"                  : [],
-                    "execution_path"            : "GENERAL_PHOTO",
-                }],
-                "_pipeline"       : "general_photo",
-                "_response_type"  : "general_image",
-            }
-
-        # text_document — The VLM already performed OCR per the routing prompt!
-        logger.info("[%s] → Text Document detected — using VLM extracted text", job_id)
+        # ── Stage 6: Document type classification (text_document) ────────
         extracted_text = classification.get("text", "")
+        if not extracted_text and local_ocr_result:
+            extracted_text = local_ocr_result.text
+
+        doc_type = None
+        if extracted_text.strip() and self._doc_type_clf is not None:
+            doc_type = self._doc_type_clf.classify(extracted_text)
+            if doc_type:
+                logger.info("[%s] Stage6: Document classified as '%s'.", job_id, doc_type)
+
+        # Stage 7: Result assembly
+        if route_type == "general_image":
+            logger.info("[%s] → General Image confirmed — routing to VLM.", job_id)
+            return self._run_vlm_on_file(file_path, job_id, text_density_score, None)
+
+        logger.info("[%s] → Text Document confirmed — assembling AST.", job_id)
         
+        # Determine execution path visually (PATH_1 or PATH_2 based on local OCR involvement)
+        exec_path = ExecutionPath.PATH_2_HIGH_COMPLEXITY.value
+        if local_ocr_result and local_ocr_result.confidence > 50.0:
+            exec_path = ExecutionPath.PATH_1_LOW_COMPLEXITY.value
+            
         return {
             "job_id"        : job_id,
-            "execution_path": ExecutionPath.PATH_2_HIGH_COMPLEXITY.value,
+            "execution_path": exec_path,
             "pcs_score"     : 0.0,
             "pcs_breakdown" : None,
             "pages"         : [{
                 "page_number"              : 1,
                 "extracted_text"           : extracted_text,
-                "coordinates"             : [],
+                "document_type"            : doc_type,
+                "coordinates"              : [],
                 "tables"                   : [],
                 "key_value_pairs"          : {},
                 "handwriting_detected"     : False,
                 "confidence_warning"       : False,
                 "confidence_warning_reason": None,
                 "_source_image"            : file_path,
-                "_engine"                  : "vlm_router",
+                "_engine"                  : "multi_ocr_pipeline",
+                "_ocr_confidence"          : local_ocr_result.confidence if local_ocr_result else 0.0,
+                "_ocr_strategy"            : local_ocr_result.strategy.name if local_ocr_result else "vlm",
+                "_text_density_score"      : text_density_score,
+                "_pipeline_time_ms"        : round(total_pipeline_ms, 1),
             }],
-            "_pipeline"     : "path_2_groq_vlm",
+            "_pipeline"     : "path_2_multi_ocr",
             "_response_type": "text",
         }
-
-    def _run_track_b(self, image_bgr: np.ndarray, file_path: str, job_id: str) -> dict[str, Any]:
-        """
-        Local-First, Confidence-Gated routing for Track B:
-
-          Step 1: Pre-process image (deskew + TELEA glare suppression + CLAHE)
-          Step 2: Calculate PCS score (for display/audit — does NOT gate routing)
-          Step 3: ALWAYS attempt CPU OCR first (pytesseract)
-          Step 4: Check OCR confidence:
-                   >= OCR_CONFIDENCE_THRESHOLD → Accept local result (Path 1, zero API cost)
-                   <  OCR_CONFIDENCE_THRESHOLD → Escalate to VLM (Path 2, fallback)
-        """
-        # Step 1: Pre-process the image
-        cleaned_bgr, downscaled_bgr = self.preprocess_image(image_bgr)
-
-        # Step 2: Calculate PCS (informational only)
-        pcs_result = self.calculate_pcs(cleaned_bgr)
-        pcs_score  = pcs_result["pcs_score"]
-
-        # Save cleaned image for downstream use and HITL image preview
-        clean_path = os.path.join(self.lego2_temp_dir, f"{job_id}_clean.jpg")
-        cv2.imwrite(clean_path, cleaned_bgr)
-
-        # Step 3: Always try local CPU OCR first
-        logger.info(
-            "[%s] Step 3: Attempting local CPU OCR first (PCS=%.4f, threshold=%.0f%%)",
-            job_id, pcs_score, self.ocr_confidence_threshold,
-        )
-        ocr_result = self.run_path_1_ocr(cleaned_bgr, downscaled_bgr)
-        ocr_conf   = ocr_result.get("_ocr_avg_confidence", 0.0)
-        no_ocr     = ocr_result.get("_path1_no_ocr", False)
-        
-        # Get extraction metrics
-        word_count = ocr_result.get("_ocr_word_count", len(ocr_result.get("coordinates", [])))
-        extracted_tables = ocr_result.get("tables", [])
-
-        # Dynamic Confidence Gating
-        current_threshold = self.ocr_confidence_threshold
-        
-        extracted_text = ocr_result.get("extracted_text", "").lower()
-        transactional_keywords = ["total", "amount", "subtotal", "invoice", "receipt", "date", "item"]
-        has_transactional_keyword = any(kw in extracted_text for kw in transactional_keywords)
-        
-        if word_count > 0:
-            current_threshold = 0.0
-            logger.info("[%s] Local CPU text detected (> 0 words). Forcing local CPU pipeline and completely blocking API escalation.", job_id)
-        
-        # Step 4: The Smart LLM Fallback (Path 2 Escalation)
-        if not no_ocr and ocr_conf >= current_threshold and word_count >= 1:
-            # ── PATH 1: Local result accepted ───────────────────────────
-            logger.info(
-                "[%s] → Path 1 ACCEPTED: OCR confidence %.1f%% >= %.1f%% threshold — NO API call",
-                job_id, ocr_conf, current_threshold,
-            )
-            ocr_result["_source_image"]   = clean_path
-            ocr_result["confidence_warning"] = False
-            ocr_result["confidence_warning_reason"] = None
-            return {
-                "job_id"        : job_id,
-                "execution_path": ExecutionPath.PATH_1_LOW_COMPLEXITY.value,
-                "pcs_score"     : pcs_score,
-                "pcs_breakdown" : pcs_result,
-                "pages"         : [ocr_result],
-                "_pipeline"     : "path_1_cpu_ocr",
-            }
-        else:
-            # ── PATH 2: Escalate to VLM ────────────────────────────
-            reason = (
-                f"PaddleOCR not installed"
-                if no_ocr
-                else f"Local OCR confidence {ocr_conf:.1f}% < {current_threshold:.1f}% threshold"
-            )
-            logger.info(
-                "[%s] → Path 2 ESCALATION: %s — calling VLM",
-                job_id, reason,
-            )
-            vlm_result = self.run_path_2_vlm(cleaned_bgr, clean_path)
-            vlm_result["_source_image"]         = clean_path
-            vlm_result["_ocr_avg_confidence"]   = ocr_conf
-            vlm_result["_ocr_escalation_reason"] = reason
-            # If VLM also failed, merge the best of both results
-            if not vlm_result.get("extracted_text") and ocr_result.get("extracted_text"):
-                logger.warning("[%s] VLM returned empty text — merging best local OCR result", job_id)
-                vlm_result["extracted_text"]  = ocr_result["extracted_text"]
-                vlm_result["key_value_pairs"]  = ocr_result.get("key_value_pairs", {})
-                vlm_result["confidence_warning"] = True
-                vlm_result["confidence_warning_reason"] = "VLM fallback: merged with local OCR result"
-            return {
-                "job_id"        : job_id,
-                "execution_path": ExecutionPath.PATH_2_HIGH_COMPLEXITY.value,
-                "pcs_score"     : pcs_score,
-                "pcs_breakdown" : pcs_result,
-                "pages"         : [vlm_result],
-                "_pipeline"     : "path_2_groq_vlm",
-            }
 
     def _run_vlm_on_file(self, file_path: str, job_id: str, pcs_score: float, pcs_breakdown) -> dict[str, Any]:
         """Directly route to VLM for problematic files that couldn't be rendered."""
@@ -1265,5 +1713,5 @@ class SmartTriageOrchestrator:
             "pcs_score"     : pcs_score,
             "pcs_breakdown" : pcs_breakdown,
             "pages"         : [page_data],
-            "_pipeline"     : "path_2_groq_vlm",
+            "_pipeline"     : "path_2_qwen_vlm",
         }

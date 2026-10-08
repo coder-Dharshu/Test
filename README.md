@@ -1,6 +1,22 @@
-# 🌿 Greencare AI — Local VLM-Powered Intelligent Document Processing
+# 🌿 Greencare AI — Local VLM-Powered Intelligent Document Processing  `v2.0`
 
-A production-ready, four-microservice IDP pipeline that uses a **local Qwen 2.5/3 30B model** to extract structured JSON from any document (PDFs, scanned images, handwritten forms) with full data privacy and offline capability.
+A production-ready, **five-microservice** IDP pipeline that uses a **local Qwen 3.6 27B model or accelerated vision endpoint** to extract structured JSON from any document (PDFs, scanned images, handwritten forms, Word docs, Excel sheets, CSVs) with full data privacy and offline capability.
+
+---
+
+## What's New in v2.0
+
+| Feature | Details |
+|---|---|
+| 🔄 **Batch Upload** | `/api/v1/batch-ingest` — submit up to 20 files in one request |
+| 🔎 **Document Search** | `/api/v1/search` — keyword search over committed documents |
+| 🔔 **Webhook Notifications** | Register callback URLs for job lifecycle events |
+| 🧹 **Auto-Cleanup** | Celery Beat purges stale temp files on schedule |
+| 📋 **.docx / .xlsx / .csv Support** | Fast-tracked natively — no VLM call needed |
+| 📊 **Analytics Dashboard** | New Lego 5 service at port 8003 with live charts |
+| 🎨 **HITL Upgrades** | Stats tab, queue search, keyboard shortcuts (A/R/N), PDF preview |
+| ⏱️ **Processing Timestamps** | Every JSON record includes `_started_at`, `_completed_at` |
+| 🤖 **Qwen Model Switcher** | `/models` endpoint lists all available vision models |
 
 ---
 
@@ -11,19 +27,23 @@ A production-ready, four-microservice IDP pipeline that uses a **local Qwen 2.5/
 │                        CLIENT (HTTP POST)                        │
 └──────────────────────────────┬──────────────────────────────────┘
                                │  POST /api/v1/ingest
+                               │  POST /api/v1/batch-ingest
                                ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│  LEGO 1 — FastAPI Gateway  (port 8000)                           │
-│  • UUID job assignment                                           │
+│  LEGO 1 — FastAPI Gateway v2  (port 8000)                        │
+│  • UUID job assignment + batch processing                        │
 │  • File persistence to shared volume                             │
 │  • Celery task enqueue → Redis                                   │
+│  • /api/v1/search  /api/v1/stats  /api/v1/webhook/register      │
 └──────────────────────────────┬───────────────────────────────────┘
                                │  Celery Worker pulls task
                                ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│  LEGO 2 — CPU Triage  (port 8001)                                │
+│  LEGO 2 — CPU Triage v2  (port 8001)                             │
 │  ┌─────────────────┐         ┌──────────────────────────────┐   │
 │  │  Digital PDF    │──Text──▶│  Fast-Track (no VLM token)  │   │
+│  │  .docx / .xlsx  │──Data──▶│                              │   │
+│  │  .csv           │──Data──▶│                              │   │
 │  └─────────────────┘         └──────────────────────────────┘   │
 │  ┌─────────────────┐                                            │
 │  │  Image / Scanned│──Deskew + Glare-Suppress ──────────────▶  │
@@ -32,20 +52,31 @@ A production-ready, four-microservice IDP pipeline that uses a **local Qwen 2.5/
                                │  image forwarded
                                ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│  LEGO 3 — VLM Vision Engine  (port 8002)                        │
+│  LEGO 3 — Qwen 3.6 27B Vision Engine v2  (port 8002)             │
 │  • Base64 image encoding                                         │
-│  • Qwen 2.5/3 30B local model @ temperature=0.0                 │
+│  • Qwen 3.6 27B Vision (local / cloud)                           │
 │  • response_format=json_object (grammar-locked)                  │
 │  • Retry + exponential back-off on rate limits                   │
+│  • /models endpoint  •  processing_time_ms in all responses     │
 └──────────────────────────────┬───────────────────────────────────┘
-                               │  JSON written to pending_review/
+                               │  JSON + timestamps written
                                ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│  LEGO 4 — HITL Dashboard  (port 7860)                            │
-│  • Gradio web UI                                                 │
-│  • Queue navigation, original image preview                      │
-│  • Editable JSON panel                                           │
-│  • Approve → final_database/ | Reject → rejected/               │
+│  LEGO 4 — HITL Dashboard v2  (port 7860)                        │
+│  • Gradio web UI with tabbed layout (Review / Statistics / Help) │
+│  • Queue search / filter   •  Keyboard shortcuts (A / R / N)    │
+│  • PDF-to-image preview    •  Processing timestamp display       │
+│  • Approve → final_database/  |  Reject → rejected/             │
+│  • Export JSON / CSV / Excel                                     │
+└──────────────────────────────────────────────────────────────────┘
+                               │  (reads same shared volumes)
+                               ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  LEGO 5 — Analytics Service  (port 8003)  [NEW v2]              │
+│  • GET /metrics              — full JSON metrics                 │
+│  • GET /metrics/dashboard    — live HTML dashboard with charts   │
+│  • GET /metrics/timeline     — 30-day approval timeline          │
+│  • GET /metrics/export       — CSV download                      │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -55,24 +86,21 @@ A production-ready, four-microservice IDP pipeline that uses a **local Qwen 2.5/
 
 ### Prerequisites
 - [Docker Desktop](https://www.docker.com/products/docker-desktop/)
-- Local inference server running **Qwen 2.5/3 30B** (e.g., Ollama or vLLM)
+- A **Qwen API key** (or local Ollama/vLLM inference endpoint)
 
 ### 1. Clone / navigate to the project
 ```bash
 cd greencare-ai
 ```
 
-### 2. Configure Local Model Endpoint
+### 2. Configure environment
 ```bash
 # Windows PowerShell
 Copy-Item .env.example .env
-# Then open .env in a text editor and set your local inference URL (e.g., http://localhost:11434)
-```
+# Then edit .env and set QWEN_API_KEY (or LOCAL_MODEL_URL)
 
-```bash
 # Linux / macOS
-cp .env.example .env
-nano .env   # Configure local endpoint
+cp .env.example .env && nano .env
 ```
 
 ### 3. Build and start all services
@@ -80,7 +108,7 @@ nano .env   # Configure local endpoint
 docker-compose up --build
 ```
 
-First build takes ~3-5 minutes (downloading Python image + deps). Subsequent starts are instant.
+First build takes ~3–5 minutes. Subsequent starts are instant.
 
 ### 4. Open the services
 
@@ -90,81 +118,116 @@ First build takes ~3-5 minutes (downloading Python image + deps). Subsequent sta
 | 🔍 CPU Triage (Swagger UI) | http://localhost:8001/docs |
 | 🤖 VLM Vision (Swagger UI) | http://localhost:8002/docs |
 | 👁 HITL Dashboard | http://localhost:7860 |
+| 📊 Analytics Dashboard | http://localhost:8003/metrics/dashboard |
 
 ---
 
 ## Running Without Docker (Development Mode)
 
-Install dependencies:
 ```bash
 pip install -r requirements.txt
-```
-
-Start Redis (use Docker just for Redis):
-```bash
 docker run -d -p 6379:6379 redis:7-alpine
 ```
 
-Open four terminals and run:
+Open five terminals:
 
-**Terminal 1 — Lego 2 (Triage)**
 ```bash
+# Terminal 1 — Triage
 uvicorn lego2_triage.triage_service:app --port 8001 --reload
-```
 
-**Terminal 2 — Lego 3 (VLM Engine)**
-```bash
-set LOCAL_VLM_URL=http://localhost:11434   # Windows
-uvicorn lego3_vlm.vlm_engine:app --port 8002 --reload
-```
+# Terminal 2 — Qwen 3.6 27B Engine
+uvicorn lego3_qwen.qwen_engine:app --port 8002 --reload
 
-**Terminal 3 — Celery Worker**
-```bash
+# Terminal 3 — Celery Worker
 celery -A lego1_gateway.worker.celery_app worker --loglevel=info
-```
 
-**Terminal 4 — Lego 1 (Gateway) + Lego 4 (HITL)**
-```bash
+# Terminal 4 — Celery Beat (auto-cleanup)
+celery -A lego1_gateway.worker.celery_app beat --loglevel=info
+
+# Terminal 5 — Gateway + HITL + Analytics
 uvicorn lego1_gateway.main:app --port 8000 --reload
-# In a separate terminal:
 python lego4_hitl/hitl_ui.py
+uvicorn lego5_analytics.analytics_service:app --port 8003 --reload
 ```
 
 ---
 
-## Testing the Pipeline
+## API Reference
 
-### Submit a digital PDF (fast-track, no VLM token used)
+### Ingestion
 ```bash
-curl -X POST http://localhost:8000/api/v1/ingest \
-  -F "file=@/path/to/your/document.pdf"
+# Single file
+curl -X POST http://localhost:8000/api/v1/ingest -F "file=@/path/to/doc.pdf"
+
+# Batch (multiple files)
+curl -X POST http://localhost:8000/api/v1/batch-ingest \
+  -F "files=@doc1.pdf" -F "files=@doc2.jpg" -F "files=@report.docx"
 ```
 
-### Submit a photo/scan (will call VLM)
+### Status
 ```bash
-curl -X POST http://localhost:8000/api/v1/ingest \
-  -F "file=@/path/to/scanned_form.jpg"
-```
-
-### Check job status
-```bash
+# Single job
 curl http://localhost:8000/api/v1/status/{job_id}
+
+# Multiple jobs at once
+curl "http://localhost:8000/api/v1/batch-status?job_ids=abc&job_ids=def"
 ```
 
-### Open the HITL dashboard to review results
-Navigate to **http://localhost:7860**, click **Refresh Queue**, then navigate through pending documents.
+### Search
+```bash
+# Keyword search over committed documents
+curl "http://localhost:8000/api/v1/search?q=invoice&doc_type=invoice&limit=10"
+```
+
+### Statistics
+```bash
+curl http://localhost:8000/api/v1/stats
+```
+
+### Webhooks
+```bash
+# Register a callback URL
+curl -X POST http://localhost:8000/api/v1/webhook/register \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://yourserver.com/callback", "description": "My hook"}'
+
+# List webhooks
+curl http://localhost:8000/api/v1/webhook/list
+
+# Delete a webhook
+curl -X DELETE http://localhost:8000/api/v1/webhook/{hook_id}
+```
+
+### Analytics
+```bash
+# Full JSON metrics
+curl http://localhost:8003/metrics
+
+# Download CSV report
+curl http://localhost:8003/metrics/export -o report.csv
+
+# Open HTML dashboard in browser
+open http://localhost:8003/metrics/dashboard
+```
+
+### Qwen Vision Models
+```bash
+# List available models and current selection
+curl http://localhost:8002/models
+```
 
 ---
 
 ## Extracted JSON Schema
 
-Every document processed through VLM returns:
+Every document processed through the VLM returns:
 
 ```json
 {
   "document_type": "invoice",
   "language": "en",
   "extracted_text": "Full verbatim text...",
+  "markdown_tables": "| Col1 | Col2 |...",
   "key_value_pairs": {
     "Invoice No": "INV-2024-001",
     "Date": "2024-01-15",
@@ -177,13 +240,51 @@ Every document processed through VLM returns:
       "rows": [["Widget A", "10", "$125.00"]]
     }
   ],
+  "visual_grounding": [
+    { "box_2d": [10, 20, 150, 80], "label": "logo" }
+  ],
   "handwriting_detected": false,
   "confidence_warning": false,
   "confidence_warning_reason": null,
-  "_pipeline": "vlm_vision",
-  "_job_id": "uuid-here"
+  "_pipeline": "qwen_vision",
+  "_job_id": "uuid-here",
+  "_started_at": "2026-08-22T10:00:00+00:00",
+  "_completed_at": "2026-08-22T10:00:12+00:00",
+  "_filename": "invoice.pdf"
 }
 ```
+
+---
+
+## Webhook Payload
+
+When a job transitions to `pending_review`, your registered URL receives:
+
+```http
+POST https://yourserver.com/callback
+Content-Type: application/json
+X-Greencare-Event: job.pending_review
+X-Greencare-Signature: sha256=<hmac_hex>
+
+{
+  "job_id": "abc-123",
+  "status": "pending_review",
+  "pipeline": "qwen_vision",
+  "filename": "document.jpg"
+}
+```
+
+Verify the signature: `HMAC-SHA256(body, WEBHOOK_SECRET)`.
+
+---
+
+## HITL Dashboard Keyboard Shortcuts
+
+| Key | Action |
+|---|---|
+| `A` | Approve & commit current document |
+| `R` | Reject current document |
+| `N` | Refresh queue / load next document |
 
 ---
 
@@ -191,14 +292,15 @@ Every document processed through VLM returns:
 
 | Decision | Rationale |
 |---|---|
-| Local Qwen 2.5/3 30B over Cloud APIs | Full data privacy, offline capability, zero recurring API costs |
-| `response_format=json_object` | Grammar-level enforcement prevents hallucinated JSON formats |
+| Qwen 3.6 27B Vision default | State-of-the-art accuracy & speed; switch via `QWEN_MODEL` env var |
+| `response_format=json_object` | Grammar-level enforcement prevents hallucinated formats |
 | `temperature=0.0` | Deterministic extraction; identical docs produce identical outputs |
-| CPU triage first | Bypasses the VLM for digital PDFs; ~60% of enterprise docs are digital |
-| OpenCV deskew + CLAHE | Better image quality → fewer VLM errors and lower confidence warnings |
-| HITL before database write | Human review catches the ~5-10% edge cases where VLMs err |
+| CPU triage first | Bypasses VLM for digital PDFs, DOCX, XLSX, CSV — ~70% of docs |
+| OpenCV deskew + CLAHE | Better image quality → fewer VLM errors |
+| Webhook HMAC-SHA256 | Allows receivers to verify payload authenticity |
+| Celery Beat for cleanup | Keeps temp disk usage bounded without manual intervention |
 
-> 🔒 **Data Privacy:** This architecture uses a local Qwen 30B model. All document content remains strictly on-premise, making it naturally compliant with strict privacy regulations (GDPR, HIPAA) for PII and PHI.
+> 🔒 **Data Privacy:** This architecture uses a local Qwen 3.6 27B model or cloud endpoint. For maximum privacy, configure the local model endpoint (`LOCAL_MODEL_URL`). All CPU-fast-tracked documents (PDF, DOCX, XLSX, CSV) **never** leave your server.
 
 ---
 
@@ -206,22 +308,48 @@ Every document processed through VLM returns:
 
 ```
 greencare-ai/
-├── Dockerfile                  # Unified image for all services
-├── docker-compose.yml          # Orchestrates all 6 containers
-├── requirements.txt            # Python dependencies
-├── .env.example                # API key template
-├── README.md                   # This file
+├── Dockerfile                     # Unified image for all services
+├── docker-compose.yml             # Orchestrates 8 containers
+├── requirements.txt               # Python dependencies
+├── .env.example                   # Environment variable template
+├── README.md                      # This file
 │
 ├── lego1_gateway/
-│   ├── main.py                 # FastAPI Gateway (port 8000)
-│   └── worker.py               # Celery pipeline orchestrator
+│   ├── main.py                    # FastAPI Gateway v2 (port 8000)
+│   └── worker.py                  # Celery pipeline orchestrator v2
 │
 ├── lego2_triage/
-│   └── triage_service.py       # CPU fast-track + image enhancement (port 8001)
+│   └── triage_service.py          # CPU triage v2 (.docx/.xlsx/.csv added)
 │
-├── lego3_vlm/
-│   └── vlm_engine.py          # Local Qwen 2.5/3 30B extraction (port 8002)
+├── lego3_qwen/
+│   └── qwen_engine.py             # Qwen 3.6 27B Vision Engine v2
 │
-└── lego4_hitl/
-    └── hitl_ui.py              # Gradio HITL dashboard (port 7860)
+├── lego4_hitl/
+│   └── hitl_ui.py                 # HITL Dashboard v2 (Gradio)
+│
+├── lego5_analytics/               # [NEW v2]
+│   └── analytics_service.py       # Analytics metrics service (port 8003)
+│
+├── smart_triage/                  # Advanced orchestrator (SmartTriage)
+│   ├── orchestrator.py
+│   ├── ast_compiler.py
+│   ├── ocr_engine.py
+│   └── db_analyzer.py
+│
+└── tests/
+    ├── conftest.py
+    ├── test_gateway_v2.py         # [NEW v2]
+    ├── test_classification.py
+    ├── test_db_analyzer.py
+    ├── test_excel_sheets.py
+    └── test_ocr_engine.py
+```
+
+---
+
+## Running Tests
+
+```bash
+pip install -r requirements.txt
+pytest tests/ -v
 ```

@@ -1,0 +1,787 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Greencare AI — Intelligent Document Processing</title>
+  <meta name="description" content="AI-powered document processing pipeline. Extract structured data from PDFs, images, Word docs and more with Qwen 3.6 27B Vision." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #080b14;
+      --bg2:       #0e1120;
+      --surface:   #13172b;
+      --surface2:  #1c2140;
+      --accent:    #6366f1;
+      --accent2:   #10b981;
+      --accent3:   #f59e0b;
+      --text:      #e2e8f0;
+      --muted:     #64748b;
+      --border:    rgba(99,102,241,0.18);
+      --glow:      rgba(99,102,241,0.3);
+    }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      font-family: 'Inter', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      overflow-x: hidden;
+      line-height: 1.6;
+    }
+
+    /* ── Grid background ── */
+    body::before {
+      content: '';
+      position: fixed; inset: 0;
+      background-image:
+        linear-gradient(rgba(99,102,241,0.04) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(99,102,241,0.04) 1px, transparent 1px);
+      background-size: 60px 60px;
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    /* ── Nav ── */
+    nav {
+      position: fixed; top: 0; left: 0; right: 0;
+      z-index: 100;
+      display: flex; align-items: center; gap: 32px;
+      padding: 0 48px;
+      height: 64px;
+      background: rgba(8,11,20,0.8);
+      backdrop-filter: blur(20px);
+      border-bottom: 1px solid var(--border);
+    }
+    .nav-logo {
+      display: flex; align-items: center; gap: 10px;
+      font-size: 1.1rem; font-weight: 700;
+      text-decoration: none; color: var(--text);
+    }
+    .nav-logo .icon {
+      width: 32px; height: 32px; border-radius: 8px;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      display: grid; place-items: center; font-size: 16px;
+    }
+    .nav-links { display: flex; gap: 28px; margin-left: auto; }
+    .nav-links a {
+      color: var(--muted); text-decoration: none;
+      font-size: 0.875rem; font-weight: 500;
+      transition: color .2s;
+    }
+    .nav-links a:hover { color: var(--text); }
+    .nav-cta {
+      background: var(--accent);
+      color: #fff !important;
+      padding: 8px 20px;
+      border-radius: 8px;
+      font-weight: 600 !important;
+      transition: transform .2s, box-shadow .2s !important;
+    }
+    .nav-cta:hover { transform: translateY(-1px); box-shadow: 0 4px 20px var(--glow) !important; color: #fff !important; }
+
+    /* ── Hero ── */
+    .hero {
+      position: relative; z-index: 1;
+      min-height: 100vh;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      text-align: center;
+      padding: 120px 24px 80px;
+      overflow: hidden;
+    }
+
+    /* Radial glow behind hero */
+    .hero::after {
+      content: '';
+      position: absolute; top: 10%; left: 50%;
+      transform: translateX(-50%);
+      width: 800px; height: 600px;
+      background: radial-gradient(ellipse, rgba(99,102,241,0.15) 0%, transparent 70%);
+      pointer-events: none;
+    }
+
+    .hero-badge {
+      display: inline-flex; align-items: center; gap: 8px;
+      background: rgba(99,102,241,0.12);
+      border: 1px solid rgba(99,102,241,0.3);
+      border-radius: 20px;
+      padding: 6px 16px;
+      font-size: 0.8rem; font-weight: 600;
+      color: #a5b4fc;
+      margin-bottom: 28px;
+      letter-spacing: 0.04em;
+      animation: fadeDown .6s ease both;
+    }
+    .hero-badge .dot {
+      width: 6px; height: 6px; border-radius: 50%;
+      background: var(--accent2);
+      animation: pulse 2s infinite;
+    }
+
+    h1 {
+      font-size: clamp(2.8rem, 7vw, 5.5rem);
+      font-weight: 900;
+      line-height: 1.1;
+      letter-spacing: -0.03em;
+      animation: fadeDown .7s .1s ease both;
+    }
+    .gradient-text {
+      background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 40%, #10b981 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .hero-sub {
+      margin-top: 24px;
+      font-size: 1.15rem;
+      color: var(--muted);
+      max-width: 600px;
+      line-height: 1.7;
+      animation: fadeDown .7s .2s ease both;
+    }
+
+    .hero-ctas {
+      display: flex; gap: 16px; flex-wrap: wrap;
+      justify-content: center;
+      margin-top: 40px;
+      animation: fadeDown .7s .3s ease both;
+    }
+    .btn-primary {
+      display: inline-flex; align-items: center; gap: 8px;
+      background: linear-gradient(135deg, var(--accent), #7c3aed);
+      color: #fff;
+      font-size: 1rem; font-weight: 600;
+      padding: 14px 32px;
+      border-radius: 12px;
+      text-decoration: none;
+      transition: transform .2s, box-shadow .2s;
+      box-shadow: 0 4px 30px rgba(99,102,241,0.4);
+    }
+    .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 8px 40px rgba(99,102,241,0.5); }
+    .btn-secondary {
+      display: inline-flex; align-items: center; gap: 8px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text);
+      font-size: 1rem; font-weight: 500;
+      padding: 14px 32px;
+      border-radius: 12px;
+      text-decoration: none;
+      transition: transform .2s, border-color .2s;
+    }
+    .btn-secondary:hover { transform: translateY(-2px); border-color: var(--accent); }
+
+    /* Floating cards */
+    .hero-visual {
+      position: relative;
+      margin-top: 72px;
+      width: 100%; max-width: 800px;
+      animation: fadeUp .8s .4s ease both;
+    }
+    .hero-mockup {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 24px;
+      box-shadow: 0 40px 80px rgba(0,0,0,0.5);
+      text-align: left;
+    }
+    .mockup-bar {
+      display: flex; gap: 6px; margin-bottom: 20px;
+    }
+    .mockup-bar span {
+      width: 12px; height: 12px; border-radius: 50%;
+    }
+    .mockup-bar span:nth-child(1) { background: #ef4444; }
+    .mockup-bar span:nth-child(2) { background: #f59e0b; }
+    .mockup-bar span:nth-child(3) { background: #22c55e; }
+    .mockup-content {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+    .mockup-left {
+      background: var(--bg2);
+      border-radius: 12px;
+      padding: 16px;
+      min-height: 180px;
+    }
+    .mockup-right {
+      display: flex; flex-direction: column; gap: 10px;
+    }
+    .mockup-tag {
+      display: inline-flex; align-items: center; gap: 6px;
+      background: rgba(99,102,241,0.12);
+      border: 1px solid rgba(99,102,241,0.25);
+      border-radius: 6px;
+      padding: 4px 10px;
+      font-size: 0.7rem; font-weight: 600; color: #a5b4fc;
+      margin-bottom: 10px;
+    }
+    .mockup-skeleton {
+      height: 10px; border-radius: 4px;
+      background: var(--surface2);
+      margin-bottom: 8px;
+      animation: shimmer 2s infinite;
+    }
+    .mockup-skeleton.short { width: 60%; }
+    .mockup-skeleton.medium { width: 80%; }
+
+    .mockup-kpi {
+      background: var(--bg2);
+      border-radius: 10px;
+      padding: 14px;
+      flex: 1;
+    }
+    .mockup-kpi .k-label { font-size: 0.65rem; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+    .mockup-kpi .k-value { font-size: 1.4rem; font-weight: 700; margin-top: 4px; }
+    .mockup-kpi .k-value.green  { color: var(--accent2); }
+    .mockup-kpi .k-value.purple { color: var(--accent); }
+    .mockup-kpi .k-value.amber  { color: var(--accent3); }
+
+    /* Floating badge cards around the mockup */
+    .float-card {
+      position: absolute;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 10px 14px;
+      font-size: 0.78rem; font-weight: 500;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.4);
+      display: flex; align-items: center; gap: 8px;
+      white-space: nowrap;
+    }
+    .float-card.one  { top: -20px; right: -40px; animation: float 4s ease-in-out infinite; }
+    .float-card.two  { bottom: 40px; left: -60px; animation: float 4s 1.5s ease-in-out infinite; }
+    .float-card.three{ top: 100px; right: -70px; animation: float 4s 2s ease-in-out infinite; }
+
+    /* ── Stats bar ── */
+    .stats-bar {
+      position: relative; z-index: 1;
+      background: var(--surface);
+      border-top: 1px solid var(--border);
+      border-bottom: 1px solid var(--border);
+      padding: 32px 48px;
+      display: flex; justify-content: center; gap: 64px;
+      flex-wrap: wrap;
+    }
+    .stat-item { text-align: center; }
+    .stat-item .s-value {
+      font-size: 2.2rem; font-weight: 800;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    }
+    .stat-item .s-label { font-size: 0.825rem; color: var(--muted); margin-top: 4px; }
+
+    /* ── Section commons ── */
+    section {
+      position: relative; z-index: 1;
+      padding: 100px 48px;
+    }
+    .section-label {
+      display: inline-flex; align-items: center; gap: 8px;
+      font-size: 0.78rem; font-weight: 600;
+      color: #a5b4fc; letter-spacing: .08em; text-transform: uppercase;
+      margin-bottom: 16px;
+    }
+    .section-label::before {
+      content: '';
+      display: block;
+      width: 24px; height: 2px;
+      background: var(--accent);
+      border-radius: 1px;
+    }
+    .section-title {
+      font-size: clamp(1.8rem, 4vw, 2.8rem);
+      font-weight: 800; letter-spacing: -0.02em;
+      line-height: 1.2;
+    }
+    .section-sub {
+      margin-top: 12px;
+      color: var(--muted); font-size: 1rem;
+      max-width: 560px; line-height: 1.7;
+    }
+    .section-head { margin-bottom: 56px; }
+
+    /* ── Features grid ── */
+    #features { background: var(--bg2); }
+    .features-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 20px;
+      max-width: 1100px;
+      margin: 0 auto;
+    }
+    .feature-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 28px;
+      transition: transform .3s, border-color .3s, box-shadow .3s;
+      cursor: default;
+    }
+    .feature-card:hover {
+      transform: translateY(-6px);
+      border-color: rgba(99,102,241,0.4);
+      box-shadow: 0 20px 60px rgba(99,102,241,0.12);
+    }
+    .feature-icon {
+      width: 48px; height: 48px; border-radius: 12px;
+      display: grid; place-items: center; font-size: 22px;
+      margin-bottom: 18px;
+    }
+    .feature-card h3 { font-size: 1.05rem; font-weight: 700; margin-bottom: 8px; }
+    .feature-card p { color: var(--muted); font-size: 0.875rem; line-height: 1.65; }
+    .feature-card .tag {
+      display: inline-block;
+      margin-top: 14px;
+      background: rgba(99,102,241,0.12);
+      border: 1px solid rgba(99,102,241,0.2);
+      border-radius: 4px;
+      padding: 2px 10px;
+      font-size: 0.7rem; font-weight: 600; color: #a5b4fc;
+    }
+
+    /* ── Pipeline / How it works ── */
+    #how { max-width: 900px; margin: 0 auto; }
+    #how section { padding: 100px 0; }
+    .pipeline {
+      display: flex; flex-direction: column; gap: 0;
+      max-width: 700px; margin: 0 auto;
+    }
+    .pipe-step {
+      display: grid;
+      grid-template-columns: 56px 1fr;
+      gap: 20px;
+      align-items: start;
+      padding-bottom: 40px;
+      position: relative;
+    }
+    .pipe-step:not(:last-child)::after {
+      content: '';
+      position: absolute;
+      left: 27px; top: 56px; bottom: 0;
+      width: 2px;
+      background: linear-gradient(to bottom, var(--accent), transparent);
+    }
+    .pipe-num {
+      width: 56px; height: 56px; border-radius: 14px;
+      background: linear-gradient(135deg, var(--accent), #7c3aed);
+      display: grid; place-items: center;
+      font-size: 1.1rem; font-weight: 800;
+      color: #fff; flex-shrink: 0;
+      box-shadow: 0 8px 24px rgba(99,102,241,0.35);
+    }
+    .pipe-content h3 {
+      font-size: 1.05rem; font-weight: 700;
+      padding-top: 14px; margin-bottom: 6px;
+    }
+    .pipe-content p { color: var(--muted); font-size: 0.875rem; line-height: 1.65; }
+    .pipe-badge {
+      display: inline-flex; align-items: center; gap: 6px;
+      margin-top: 10px;
+      background: rgba(16,185,129,0.1);
+      border: 1px solid rgba(16,185,129,0.25);
+      border-radius: 6px; padding: 3px 10px;
+      font-size: 0.7rem; font-weight: 600; color: var(--accent2);
+    }
+
+    /* ── Formats section ── */
+    .formats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 12px; max-width: 900px; margin: 0 auto;
+    }
+    .format-chip {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 18px;
+      text-align: center;
+      transition: border-color .2s, transform .2s;
+    }
+    .format-chip:hover { border-color: var(--accent); transform: translateY(-3px); }
+    .format-chip .f-icon { font-size: 28px; margin-bottom: 8px; }
+    .format-chip .f-label { font-size: 0.8rem; font-weight: 600; }
+    .format-chip .f-sub { font-size: 0.7rem; color: var(--muted); margin-top: 3px; }
+
+    /* ── CTA section ── */
+    .cta-section {
+      text-align: center; padding: 100px 48px;
+    }
+    .cta-box {
+      max-width: 700px; margin: 0 auto;
+      background: linear-gradient(135deg, rgba(99,102,241,0.1), rgba(16,185,129,0.05));
+      border: 1px solid var(--border);
+      border-radius: 28px;
+      padding: 64px 48px;
+      position: relative; overflow: hidden;
+    }
+    .cta-box::before {
+      content: '';
+      position: absolute; top: -60px; right: -60px;
+      width: 300px; height: 300px;
+      background: radial-gradient(circle, rgba(99,102,241,0.15), transparent 70%);
+    }
+    .cta-box h2 { font-size: 2.2rem; font-weight: 800; letter-spacing: -0.02em; }
+    .cta-box p { color: var(--muted); margin-top: 12px; margin-bottom: 36px; }
+
+    /* ── Footer ── */
+    footer {
+      background: var(--surface);
+      border-top: 1px solid var(--border);
+      padding: 40px 48px;
+      display: flex; align-items: center; justify-content: space-between;
+      flex-wrap: wrap; gap: 16px;
+      position: relative; z-index: 1;
+    }
+    footer .f-logo { display: flex; align-items: center; gap: 8px; font-weight: 700; }
+    footer .f-links { display: flex; gap: 24px; }
+    footer .f-links a { color: var(--muted); text-decoration: none; font-size: 0.85rem; }
+    footer .f-links a:hover { color: var(--text); }
+    footer .f-copy { color: var(--muted); font-size: 0.8rem; }
+
+    /* ── Animations ── */
+    @keyframes fadeDown {
+      from { opacity: 0; transform: translateY(-24px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    @keyframes fadeUp {
+      from { opacity: 0; transform: translateY(32px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    @keyframes float {
+      0%, 100% { transform: translateY(0); }
+      50%       { transform: translateY(-10px); }
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0.4; }
+    }
+    @keyframes shimmer {
+      0%   { opacity: 0.4; }
+      50%  { opacity: 0.8; }
+      100% { opacity: 0.4; }
+    }
+    @keyframes countUp { from { opacity: 0; } to { opacity: 1; } }
+
+    /* Scroll reveal */
+    .reveal { opacity: 0; transform: translateY(32px); transition: opacity .6s ease, transform .6s ease; }
+    .reveal.visible { opacity: 1; transform: none; }
+
+    @media (max-width: 768px) {
+      nav { padding: 0 20px; }
+      .nav-links { display: none; }
+      section { padding: 64px 24px; }
+      .stats-bar { padding: 32px 24px; gap: 32px; }
+      .hero { padding: 100px 24px 60px; }
+      .float-card { display: none; }
+      .mockup-content { grid-template-columns: 1fr; }
+      footer { flex-direction: column; text-align: center; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- Navigation -->
+<nav>
+  <a href="/" class="nav-logo">
+    <div class="icon">🌿</div>
+    Greencare AI
+  </a>
+  <div class="nav-links">
+    <a href="#features">Features</a>
+    <a href="#how">How It Works</a>
+    <a href="#formats">Formats</a>
+    <a href="/web/dashboard.html" class="nav-cta">Open Dashboard →</a>
+  </div>
+</nav>
+
+<!-- Hero -->
+<div class="hero">
+  <div class="hero-badge">
+    <span class="dot"></span>
+    Powered by Qwen 3.6 27B Vision · Runs Locally
+  </div>
+
+  <h1>
+    Extract Structure<br/>
+    from <span class="gradient-text">Any Document</span>
+  </h1>
+
+  <p class="hero-sub">
+    AI-powered IDP pipeline that turns scanned PDFs, images, Word docs,
+    and spreadsheets into clean, structured JSON — with human review built in.
+  </p>
+
+  <div class="hero-ctas">
+    <a href="/web/dashboard.html" class="btn-primary">
+      🚀 Open Dashboard
+    </a>
+    <a href="/docs" class="btn-secondary">
+      📖 API Docs
+    </a>
+  </div>
+
+  <!-- Mockup -->
+  <div class="hero-visual">
+    <div class="float-card one">
+      <span>✅</span> Invoice approved · 1.2s
+    </div>
+    <div class="float-card two">
+      <span>🤖</span> Qwen 3.6 27B · 94% confidence
+    </div>
+    <div class="float-card three">
+      <span>📊</span> 12 docs in queue
+    </div>
+
+    <div class="hero-mockup">
+      <div class="mockup-bar">
+        <span></span><span></span><span></span>
+      </div>
+      <div class="mockup-content">
+        <div class="mockup-left">
+          <div class="mockup-tag">📄 invoice_q3.pdf</div>
+          <div class="mockup-skeleton medium"></div>
+          <div class="mockup-skeleton short"></div>
+          <div class="mockup-skeleton"></div>
+          <div class="mockup-skeleton medium"></div>
+          <div class="mockup-skeleton short"></div>
+          <div class="mockup-skeleton"></div>
+          <div class="mockup-skeleton medium"></div>
+        </div>
+        <div class="mockup-right">
+          <div class="mockup-kpi">
+            <div class="k-label">Documents Processed</div>
+            <div class="k-value purple" id="stat-processed">—</div>
+          </div>
+          <div class="mockup-kpi">
+            <div class="k-label">Approval Rate</div>
+            <div class="k-value green" id="stat-rate">—</div>
+          </div>
+          <div class="mockup-kpi">
+            <div class="k-label">Pending Review</div>
+            <div class="k-value amber" id="stat-pending">—</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Live stats bar -->
+<div class="stats-bar">
+  <div class="stat-item">
+    <div class="s-value" id="s1">0</div>
+    <div class="s-label">Documents Processed</div>
+  </div>
+  <div class="stat-item">
+    <div class="s-value" id="s2">0%</div>
+    <div class="s-label">Approval Rate</div>
+  </div>
+  <div class="stat-item">
+    <div class="s-value" id="s3">5</div>
+    <div class="s-label">File Formats Supported</div>
+  </div>
+  <div class="stat-item">
+    <div class="s-value">3</div>
+    <div class="s-label">AI Vision Models Available</div>
+  </div>
+</div>
+
+<!-- Features -->
+<section id="features">
+  <div style="max-width:1100px;margin:0 auto">
+    <div class="section-head">
+      <div class="section-label">What We Do</div>
+      <h2 class="section-title">Everything you need for<br/>intelligent document processing</h2>
+      <p class="section-sub">From ingestion to approval, a complete pipeline built for production.</p>
+    </div>
+    <div class="features-grid">
+
+      <div class="feature-card reveal">
+        <div class="feature-icon" style="background:rgba(99,102,241,0.12)">🤖</div>
+        <h3>Qwen 3.6 27B Vision Extraction</h3>
+        <p>Qwen 3.6 27B Vision multimodal model extracts text, tables, key-value pairs, and visual grounding coordinates from any document.</p>
+        <span class="tag">Sub-2s extraction</span>
+      </div>
+
+      <div class="feature-card reveal">
+        <div class="feature-icon" style="background:rgba(16,185,129,0.12)">⚡</div>
+        <h3>CPU Fast-Track</h3>
+        <p>Digital PDFs, Word docs, Excel sheets, and CSVs are extracted natively on CPU — no AI API call needed. Saves cost and latency for ~70% of documents.</p>
+        <span class="tag" style="color:var(--accent2);border-color:rgba(16,185,129,0.3)">Zero API cost</span>
+      </div>
+
+      <div class="feature-card reveal">
+        <div class="feature-icon" style="background:rgba(245,158,11,0.12)">👁</div>
+        <h3>Human-in-the-Loop Review</h3>
+        <p>Every extraction goes through a review queue. Approve, edit JSON inline, or reject — with keyboard shortcuts (A / R / N) for high-throughput review.</p>
+        <span class="tag" style="color:var(--accent3);border-color:rgba(245,158,11,0.3)">Built-in quality control</span>
+      </div>
+
+      <div class="feature-card reveal">
+        <div class="feature-icon" style="background:rgba(139,92,246,0.12)">🔄</div>
+        <h3>Batch Processing</h3>
+        <p>Submit up to 20 files in a single API call. Async Celery workers process them in parallel. Poll batch status or receive webhook callbacks.</p>
+        <span class="tag" style="color:#c4b5fd;border-color:rgba(139,92,246,0.3)">Parallel pipelines</span>
+      </div>
+
+      <div class="feature-card reveal">
+        <div class="feature-icon" style="background:rgba(6,182,212,0.12)">📊</div>
+        <h3>Analytics Dashboard</h3>
+        <p>Real-time pipeline metrics: approval rates, processing times, pipeline breakdown, document-type distribution, and 30-day timeline charts.</p>
+        <span class="tag" style="color:#67e8f9;border-color:rgba(6,182,212,0.3)">Live metrics</span>
+      </div>
+
+      <div class="feature-card reveal">
+        <div class="feature-icon" style="background:rgba(249,115,22,0.12)">🔔</div>
+        <h3>Webhook Notifications</h3>
+        <p>Register callback URLs for job lifecycle events. Payloads are HMAC-SHA256 signed so you can verify authenticity on your server.</p>
+        <span class="tag" style="color:#fdba74;border-color:rgba(249,115,22,0.3)">Secure callbacks</span>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<!-- How it works -->
+<section id="how" style="padding:100px 48px">
+  <div style="max-width:800px;margin:0 auto">
+    <div class="section-head reveal">
+      <div class="section-label">Pipeline</div>
+      <h2 class="section-title">Five steps, fully automated</h2>
+      <p class="section-sub">Upload a document and the pipeline handles everything. You only step in to approve.</p>
+    </div>
+
+    <div class="pipeline">
+      <div class="pipe-step reveal">
+        <div class="pipe-num">1</div>
+        <div class="pipe-content">
+          <h3>Ingest via API or Dashboard</h3>
+          <p>Upload a single file or batch of up to 20 files via the REST API or drag-and-drop dashboard. The gateway assigns a UUID job ID and queues it in Redis.</p>
+          <div class="pipe-badge">POST /api/v1/ingest</div>
+        </div>
+      </div>
+      <div class="pipe-step reveal">
+        <div class="pipe-num">2</div>
+        <div class="pipe-content">
+          <h3>CPU Triage (Lego 2)</h3>
+          <p>The Celery worker sends the file to the CPU triage service. Digital PDFs, DOCX, XLSX, and CSV files are extracted immediately on CPU without any API call.</p>
+          <div class="pipe-badge">Fast-track or forward to VLM</div>
+        </div>
+      </div>
+      <div class="pipe-step reveal">
+        <div class="pipe-num">3</div>
+        <div class="pipe-content">
+          <h3>Qwen 3.6 27B Vision Extraction (Lego 3)</h3>
+          <p>Scanned PDFs and images are preprocessed (deskew, glare suppression) then processed by Qwen 3.6 27B Vision model. Output is grammar-locked to valid JSON.</p>
+          <div class="pipe-badge">~1–3s per page</div>
+        </div>
+      </div>
+      <div class="pipe-step reveal">
+        <div class="pipe-num">4</div>
+        <div class="pipe-content">
+          <h3>Human Review (Lego 4)</h3>
+          <p>Extracted data lands in the review queue. A reviewer approves, edits, or rejects the record. Approved records are committed to the final database.</p>
+          <div class="pipe-badge">Dashboard + keyboard shortcuts</div>
+        </div>
+      </div>
+      <div class="pipe-step reveal" style="padding-bottom:0">
+        <div class="pipe-num">5</div>
+        <div class="pipe-content">
+          <h3>Analytics & Export</h3>
+          <p>Committed records are queryable via full-text search. Export to JSON, CSV, or Excel. Live analytics show pipeline health and throughput trends.</p>
+          <div class="pipe-badge">Search · Export · Dashboard</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Supported Formats -->
+<section id="formats" style="background:var(--bg2);padding:100px 48px">
+  <div style="max-width:900px;margin:0 auto">
+    <div class="section-head reveal" style="text-align:center">
+      <div class="section-label" style="justify-content:center">Supported</div>
+      <h2 class="section-title">Every format, one pipeline</h2>
+      <p class="section-sub" style="margin:12px auto">Digital, scanned, handwritten — if it's a document, we handle it.</p>
+    </div>
+    <div class="formats-grid">
+      <div class="format-chip reveal"><div class="f-icon">📄</div><div class="f-label">PDF</div><div class="f-sub">Digital & Scanned</div></div>
+      <div class="format-chip reveal"><div class="f-icon">📷</div><div class="f-label">JPG / PNG</div><div class="f-sub">Photos & Scans</div></div>
+      <div class="format-chip reveal"><div class="f-icon">📑</div><div class="f-label">TIFF / BMP</div><div class="f-sub">Hi-res Images</div></div>
+      <div class="format-chip reveal"><div class="f-icon">📝</div><div class="f-label">DOCX</div><div class="f-sub">Word Documents</div></div>
+      <div class="format-chip reveal"><div class="f-icon">📊</div><div class="f-label">XLSX</div><div class="f-sub">Excel Sheets</div></div>
+      <div class="format-chip reveal"><div class="f-icon">📋</div><div class="f-label">CSV</div><div class="f-sub">Tabular Data</div></div>
+    </div>
+  </div>
+</section>
+
+<!-- CTA -->
+<section class="cta-section">
+  <div class="cta-box reveal">
+    <h2>Start processing documents<br/><span class="gradient-text">in under 60 seconds</span></h2>
+    <p>Run with Docker Compose. No cloud lock-in. Your data stays on your server.</p>
+    <div style="display:flex;gap:16px;justify-content:center;flex-wrap:wrap">
+      <a href="/web/dashboard.html" class="btn-primary">🚀 Open Dashboard</a>
+      <a href="/docs" class="btn-secondary">📖 API Reference</a>
+    </div>
+  </div>
+</section>
+
+<!-- Footer -->
+<footer>
+  <div class="f-logo"><span>🌿</span> Greencare AI</div>
+  <div class="f-links">
+    <a href="/docs">API Docs</a>
+    <a href="/web/dashboard.html">Dashboard</a>
+    <a href="http://localhost:8003/metrics/dashboard">Analytics</a>
+  </div>
+  <div class="f-copy">v2.0.0 · Blueprint §3</div>
+</footer>
+
+<script>
+  // Scroll reveal
+  const observer = new IntersectionObserver((entries) => {
+    entries.forEach(e => { if (e.isIntersecting) e.target.classList.add('visible'); });
+  }, { threshold: 0.1 });
+  document.querySelectorAll('.reveal').forEach(el => observer.observe(el));
+
+  // Live stats from gateway API
+  async function loadStats() {
+    try {
+      const r = await fetch('/api/v1/stats', { signal: AbortSignal.timeout(3000) });
+      if (!r.ok) return;
+      const d = await r.json();
+      const s = d.summary;
+      animateCount('s1', s.total_processed);
+      document.getElementById('s2').textContent = s.approval_rate_pct + '%';
+      document.getElementById('stat-processed').textContent = s.total_processed;
+      document.getElementById('stat-rate').textContent = s.approval_rate_pct + '%';
+      document.getElementById('stat-pending').textContent = s.pending;
+    } catch (_) { /* gateway may not be running in dev */ }
+  }
+
+  function animateCount(id, target) {
+    const el = document.getElementById(id);
+    if (!el || !target) return;
+    let start = 0;
+    const step = Math.ceil(target / 40);
+    const timer = setInterval(() => {
+      start = Math.min(start + step, target);
+      el.textContent = start.toLocaleString();
+      if (start >= target) clearInterval(timer);
+    }, 40);
+  }
+
+  loadStats();
+</script>
+</body>
+</html>

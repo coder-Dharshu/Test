@@ -698,7 +698,7 @@ def run_pipeline(file_path: str, job_id: str, source_filename: str):
     Routing:
       Track A  (digital PDF ≥50 chars)  → Programmatic extraction, zero API cost
       Path 1   (PCS < 0.50)             → CPU OCR via pytesseract
-      Path 2   (PCS ≥ 0.50)             → Groq Vision LLM
+      Path 2   (PCS ≥ 0.50)             → Qwen 3.6 27B Vision LLM
 
     Falls back to legacy lego2/lego3 HTTP chain if smart_triage not available.
     """
@@ -767,7 +767,7 @@ def run_pipeline(file_path: str, job_id: str, source_filename: str):
                 asset_paths = crop_visual_assets(cleaned_path, grounding, job_id)
                 final_data = {
                     "pages"       : [page_data],
-                    "_pipeline"   : "groq_vision_legacy",
+                    "_pipeline"   : "qwen_vision_legacy",
                     "_model_used" : ai_data.get("model_used", ""),
                     "_asset_paths": asset_paths,
                 }
@@ -782,8 +782,10 @@ def run_pipeline(file_path: str, job_id: str, source_filename: str):
 
         # ── Persist AST JSON to pending_review/ ──────────────────────────
         out_path = os.path.join(PENDING_DIR, f"{job_id}.json")
-        with open(out_path, "w", encoding="utf-8") as f:
+        tmp_path = out_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(final_data, f, indent=4, ensure_ascii=False)
+        os.rename(tmp_path, out_path)
 
         # Detect general_photo to surface correct response type in status API
         response_type = final_data.get("_response_type", "text")

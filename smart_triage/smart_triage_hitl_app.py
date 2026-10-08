@@ -27,7 +27,38 @@ from pathlib import Path
 
 import streamlit as st
 import pandas as pd
-from groq import Groq
+try:
+    from groq import Groq
+except ImportError:
+    Groq = None
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
+
+def get_hitl_llm_client(api_key: str):
+    local_url = os.environ.get("LOCAL_MODEL_URL") or os.environ.get("QWEN_LOCAL_URL", "")
+    if local_url and OpenAI:
+        return OpenAI(base_url=local_url, api_key=api_key or "local-qwen")
+    if api_key and api_key.startswith("gsk_") and Groq:
+        return Groq(api_key=api_key)
+    if api_key and OpenAI:
+        return OpenAI(api_key=api_key)
+    if Groq:
+        return Groq(api_key=api_key or "dummy")
+    return None
+
+# ── DB Analyzer (optional, graceful fallback) ─────────────────────────
+try:
+    from smart_triage.db_analyzer import analyze_schema, ERDiagramRenderer, PYVIS_AVAILABLE
+    DB_ANALYZER_AVAILABLE = True
+except ImportError:
+    try:
+        from db_analyzer import analyze_schema, ERDiagramRenderer, PYVIS_AVAILABLE
+        DB_ANALYZER_AVAILABLE = True
+    except ImportError:
+        DB_ANALYZER_AVAILABLE = False
+        PYVIS_AVAILABLE = False
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -138,6 +169,8 @@ if "ast_data"           not in st.session_state: st.session_state.ast_data      
 if "is_modified"        not in st.session_state: st.session_state.is_modified        = False
 if "current_page_idx"   not in st.session_state: st.session_state.current_page_idx   = 0
 if "upload_msg"         not in st.session_state: st.session_state.upload_msg         = ""
+if "selected_sheet_idx" not in st.session_state: st.session_state.selected_sheet_idx = 0  # Excel multi-sheet selector
+if "db_analysis_result" not in st.session_state: st.session_state.db_analysis_result = None  # DB ER result
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def get_pending_files() -> list[Path]:
@@ -231,13 +264,15 @@ def sanitize_headers(headers: list, n_cols: int) -> list:
     return result
 
 @st.cache_data(show_spinner=False)
-def generate_summary(extracted_text: str, doc_type: str, groq_api_key: str) -> str:
-    """Call VLM text API to produce a concise document summary."""
+def generate_summary(extracted_text: str, doc_type: str, api_key: str) -> str:
+    """Call Qwen 3.6 27B text API to produce a concise document summary."""
     if not extracted_text.strip():
         return "⚠️ No extracted text available to summarise."
     try:
-        client = Groq(api_key=groq_api_key)
-        model  = os.environ.get("GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+        client = get_hitl_llm_client(api_key)
+        if not client:
+            return "❌ No LLM client available. Check QWEN_API_KEY / GROQ_API_KEY or LOCAL_MODEL_URL."
+        model  = os.environ.get("QWEN_MODEL") or os.environ.get("GROQ_MODEL", "qwen/qwen3.6-27b")
         # Truncate very large documents to stay within token limits
         text_snippet = extracted_text[:12000]
         prompt = (
@@ -425,6 +460,228 @@ with st.sidebar:
             st.session_state.ast_data = None
             st.rerun()
 
+    # ── DB Relationship Analyzer ──────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("**🗄 Database Relationship Analyzer**")
+
+    if not DB_ANALYZER_AVAILABLE:
+        st.warning("db_analyzer module not found.")
+    else:
+        db_file = st.file_uploader(
+            "Upload SQLite / Excel / CSV",
+            type=["db", "sqlite", "sqlite3", "xlsx", "xls", "csv"],
+            key="db_upload",
+            label_visibility="collapsed",
+        )
+        if db_file is not None:
+            if st.button("🔍 Analyze Schema", use_container_width=True):
+                import tempfile
+                suffix = Path(db_file.name).suffix
+                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                    tmp.write(db_file.read())
+                    tmp_path = tmp.name
+                try:
+                    with st.spinner("Analyzing schema..."):
+                        result = analyze_schema(tmp_path)
+                    st.session_state.db_analysis_result = result
+                    st.success(result.summary())
+                except Exception as exc:
+                    st.error(f"Schema analysis failed: {exc}")
+                finally:
+                    import os as _os
+                    try: _os.unlink(tmp_path)
+                    except Exception: pass
+
+        if st.session_state.db_analysis_result is not None:
+            if st.button("❌ Clear Analysis", key="db_clear"):
+                st.session_state.db_analysis_result = None
+                st.rerun()
+
+
+def render_qa_tab(job_id: str, pages: list[dict]):
+    st.markdown("### 💬 Ask AI — Document Q&A")
+    st.markdown(
+        "<div style='color:#64748b;font-size:13px;margin-bottom:16px'>"
+        "Ask any question about this document. The AI will answer using only the "
+        "extracted content — no hallucination, grounded answers only."
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    # ── Collect all document text ──────────────────────────────────────
+    qa_texts: list[str] = []
+    for p_idx, page in enumerate(pages):
+        for elem in page.get("elements", []):
+            etype   = elem.get("type", "")
+            content = elem.get("content", {})
+            if etype in ("text", "paragraph", "heading"):
+                t = content.get("text", "").strip()
+                if t:
+                    qa_texts.append(f"[Page {page.get('page_number', p_idx+1)}]\n{t}")
+            elif etype == "key_value":
+                for pair in content.get("pairs", []):
+                    if isinstance(pair, dict):
+                        kv_line = " : ".join(str(v) for v in pair.values())
+                        qa_texts.append(kv_line)
+            elif etype == "table":
+                headers = content.get("headers", [])
+                rows    = content.get("rows", [])
+                if rows:
+                    table_lines = [" | ".join(str(h) for h in headers)]
+                    for row in rows[:20]:  # Limit for context
+                        cells = list(row.values()) if isinstance(row, dict) else row
+                        table_lines.append(" | ".join(str(c) for c in cells))
+                    qa_texts.append("Table:\n" + "\n".join(table_lines))
+        raw_et = page.get("extracted_text", "")
+        if raw_et and raw_et not in "\n".join(qa_texts):
+            qa_texts.append(raw_et)
+
+    qa_context = "\n\n".join(qa_texts)[:15000]  # Token-safe limit
+
+    llm_key = os.environ.get("QWEN_API_KEY") or os.environ.get("GROQ_API_KEY", "")
+    local_url = os.environ.get("LOCAL_MODEL_URL") or os.environ.get("QWEN_LOCAL_URL", "")
+    if not qa_context.strip():
+        st.info("⚠️ No text content found in the document to answer questions about.")
+    elif not llm_key and not local_url:
+        st.error("❌ QWEN_API_KEY / GROQ_API_KEY or LOCAL_MODEL_URL not set. Cannot use Q&A without an API key or local model.")
+    else:
+        # ── Session state for chat history ─────────────────────────────
+        chat_key = f"qa_history_{job_id}"
+        if chat_key not in st.session_state:
+            st.session_state[chat_key] = []
+
+        # ── CSS for chat bubbles ────────────────────────────────────────
+        st.markdown("""
+        <style>
+        .qa-user-bubble {
+            background: linear-gradient(135deg, #1e40af, #3b82f6);
+            color: #fff;
+            border-radius: 16px 16px 4px 16px;
+            padding: 12px 18px;
+            margin: 6px 0 6px auto;
+            max-width: 80%;
+            font-size: 14px;
+            line-height: 1.6;
+            display: inline-block;
+            float: right;
+            clear: both;
+            box-shadow: 0 2px 8px rgba(59,130,246,0.3);
+        }
+        .qa-ai-bubble {
+            background: #1e293b;
+            border: 1px solid #334155;
+            color: #e2e8f0;
+            border-radius: 16px 16px 16px 4px;
+            padding: 14px 18px;
+            margin: 6px auto 6px 0;
+            max-width: 85%;
+            font-size: 14px;
+            line-height: 1.7;
+            display: inline-block;
+            float: left;
+            clear: both;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+        }
+        .qa-clear { clear: both; }
+        .qa-label-user { color:#60a5fa; font-size:11px; font-weight:700; float:right; clear:both; margin-top:4px; margin-right:4px; }
+        .qa-label-ai   { color:#94a3b8; font-size:11px; font-weight:700; float:left; clear:both; margin-top:4px; margin-left:4px; }
+        </style>
+        """, unsafe_allow_html=True)
+
+        # ── Render chat history ──────────────────────────────────────────
+        history = st.session_state[chat_key]
+        if history:
+            for msg in history:
+                if msg["role"] == "user":
+                    st.markdown(
+                        f"<div class='qa-label-user'>You</div>"
+                        f"<div class='qa-user-bubble'>{msg['content']}</div>"
+                        f"<div class='qa-clear'></div>",
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    safe_content = msg["content"].replace("\n", "<br>")
+                    st.markdown(
+                        f"<div class='qa-label-ai'>🤖 AI</div>"
+                        f"<div class='qa-ai-bubble'>{safe_content}</div>"
+                        f"<div class='qa-clear'></div>",
+                        unsafe_allow_html=True,
+                    )
+            st.markdown("<div class='qa-clear'></div>", unsafe_allow_html=True)
+            st.markdown("---")
+
+        # ── Suggested questions ──────────────────────────────────────────
+        if not history:
+            st.markdown(
+                "<div style='color:#64748b;font-size:12px;font-weight:600;margin-bottom:8px'>💡 Suggested questions:</div>",
+                unsafe_allow_html=True,
+            )
+            suggested_qs = [
+                "What is this document about?",
+                "List all key facts and figures mentioned.",
+                "What are the dates mentioned in this document?",
+                "Summarize the main entities (names, companies, amounts).",
+                "What actions or conclusions are mentioned?",
+            ]
+            sq_cols = st.columns(len(suggested_qs))
+            for sq_col, sq in zip(sq_cols, suggested_qs):
+                with sq_col:
+                    if st.button(sq, key=f"sq_{job_id}_{sq[:20]}", use_container_width=True):
+                        st.session_state[f"qa_prefill_{job_id}"] = sq
+                        st.rerun()
+
+        # ── Q&A input ────────────────────────────────────────────────────
+        prefill_val = st.session_state.pop(f"qa_prefill_{job_id}", "")
+        with st.form(key=f"qa_form_{job_id}", clear_on_submit=True):
+            q_col, btn_col = st.columns([5, 1])
+            with q_col:
+                user_question = st.text_input(
+                    "Your question",
+                    value=prefill_val,
+                    placeholder="e.g. What is the total amount? Who is the customer?",
+                    label_visibility="collapsed",
+                    key=f"qa_input_{job_id}",
+                )
+            with btn_col:
+                submitted = st.form_submit_button("Ask ✈", use_container_width=True, type="primary")
+
+        if submitted and user_question.strip():
+            system_prompt = (
+                "You are an intelligent document analysis assistant. "
+                "You MUST answer questions ONLY using the document content provided below. "
+                "If the answer is not in the document, say so clearly. "
+                "Be concise, factual, and reference specific parts of the document when possible.\n\n"
+                f"--- DOCUMENT CONTENT ---\n{qa_context}\n--- END OF DOCUMENT ---"
+            )
+
+            api_messages = [{"role": "system", "content": system_prompt}]
+            for msg in history[-6:]:  # Last 3 turns for context window
+                api_messages.append({"role": msg["role"], "content": msg["content"]})
+            api_messages.append({"role": "user", "content": user_question.strip()})
+
+            st.session_state[chat_key].append({"role": "user", "content": user_question.strip()})
+
+            with st.spinner("🤖 Qwen 3.6 27B thinking..."):
+                try:
+                    client_qa = get_hitl_llm_client(llm_key)
+                    model_name = os.environ.get("QWEN_MODEL") or os.environ.get("GROQ_MODEL", "qwen/qwen3.6-27b")
+                    response = client_qa.chat.completions.create(
+                        messages=api_messages,
+                        model=model_name,
+                        temperature=0.2,
+                        max_tokens=1024,
+                    )
+                    ai_answer = response.choices[0].message.content or "No answer generated."
+                except Exception as exc:
+                    ai_answer = f"❌ Error calling AI: {exc}"
+
+            st.session_state[chat_key].append({"role": "assistant", "content": ai_answer})
+            st.rerun()
+
+        if history:
+            if st.button("🗑️ Clear conversation", key=f"qa_clear_{job_id}"):
+                st.session_state[chat_key] = []
+                st.rerun()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN CONTENT
@@ -440,6 +697,68 @@ st.markdown("""
 
 # ── No document loaded ────────────────────────────────────────────────────────
 if st.session_state.ast_data is None:
+    # ── DB Visualization (shown even without a document loaded) ───────────
+    if st.session_state.db_analysis_result is not None:
+        result = st.session_state.db_analysis_result
+        st.markdown("## 🗄 Database Relationship Visualization")
+        st.markdown(result.summary())
+
+        if result.warnings:
+            for w in result.warnings:
+                st.warning(w)
+
+        db_tab_graph, db_tab_table, db_tab_schema = st.tabs([
+            "🕸 Relationship Graph", "📋 Relationship Table", "🏛 Schema Details"
+        ])
+
+        renderer = ERDiagramRenderer()
+
+        with db_tab_graph:
+            if not PYVIS_AVAILABLE:
+                st.warning("Install `pyvis` (`pip install pyvis`) for interactive graph rendering.")
+                st.code(renderer.render_text_table(result))
+            elif not result.has_relationships:
+                st.info("No relationships detected to visualize.")
+                st.code(renderer.render_text_table(result))
+            else:
+                html_graph = renderer.render_html(result, height="580px")
+                if html_graph:
+                    st.components.v1.html(html_graph, height=600, scrolling=False)
+                else:
+                    st.code(renderer.render_text_table(result))
+
+        with db_tab_table:
+            if result.relationships:
+                rel_rows = [r.to_dict() for r in result.relationships]
+                df_rels = pd.DataFrame(rel_rows)
+                # Clean up column names for display
+                df_rels.columns = [c.replace("_", " ").title() for c in df_rels.columns]
+                st.dataframe(df_rels, use_container_width=True)
+            else:
+                st.info("No relationships found.")
+                for w in result.warnings:
+                    st.caption(f"ℹ️ {w}")
+
+        with db_tab_schema:
+            for table in result.tables:
+                with st.expander(
+                    f"**{table.name}** — {len(table.columns)} cols"
+                    + (f" | {table.row_count:,} rows" if table.row_count is not None else ""),
+                    expanded=False,
+                ):
+                    col_rows = [
+                        {
+                            "Column": c.name,
+                            "Type": c.data_type,
+                            "PK": "🔑" if c.is_primary_key else "",
+                            "Nullable": "✓" if c.is_nullable else "✗",
+                            "Default": c.default_value or "",
+                        }
+                        for c in table.columns
+                    ]
+                    st.dataframe(pd.DataFrame(col_rows), use_container_width=True, hide_index=True)
+        st.stop()
+
     stats = queue_stats()
     c1, c2, c3 = st.columns(3)
     c1.metric("⏳ Pending Review",  stats["pending"])
@@ -455,6 +774,7 @@ if st.session_state.ast_data is None:
     |  **Path 2** | Scanned PDF, photo, or handwritten image | **Local VLM Ready**: Configured for local offline edge models Ollama ensuring **zero data leaves your private enterprise network**. |
     """)
     st.stop()
+
 
 # ── Document loaded ───────────────────────────────────────────────────────────
 ast       = st.session_state.ast_data
@@ -494,7 +814,37 @@ if pcs_breakdown:
         bc[2].metric("Overlap (×0.10)",     f"{pcs_breakdown.get('n_overlap', 0):.3f}")
         bc[3].metric("Graphic Area (×0.05)",f"{pcs_breakdown.get('a_graphic', 0):.3f}")
 
+# ── OCR Diagnostic Panel ──────────────────────────────────────────────────────
+_first_page = pages[0] if pages else {}
+_ocr_conf   = _first_page.get("_ocr_confidence")
+_ocr_strat  = _first_page.get("_ocr_strategy")
+_density    = _first_page.get("_text_density_score")
+_pipe_ms    = _first_page.get("_pipeline_time_ms")
+_doc_type   = _first_page.get("document_type")
+if any(v is not None for v in [_ocr_conf, _ocr_strat, _density, _pipe_ms]):
+    with st.expander("🔬 OCR Pipeline Diagnostics", expanded=False):
+        d1, d2, d3, d4 = st.columns(4)
+        if _density is not None:
+            d1.metric("Text Density Score", f"{_density:.4f}",
+                      help="0=no text, 1=very dense text. >0.18=text doc, <0.04=general image")
+        if _ocr_conf is not None:
+            conf_color = "normal" if _ocr_conf >= 60 else "inverse"
+            d2.metric("OCR Confidence", f"{_ocr_conf:.1f}%",
+                      delta="High" if _ocr_conf >= 60 else "Low",
+                      delta_color=conf_color)
+        if _ocr_strat is not None:
+            d3.metric("Preprocessing Strategy", _ocr_strat.replace("_", " ").title())
+        if _pipe_ms is not None:
+            d4.metric("Pipeline Time", f"{_pipe_ms:.0f}ms")
+        if _doc_type:
+            st.markdown(
+                f"<span style='background:#1e40af;color:#bfdbfe;padding:4px 12px;"
+                f"border-radius:20px;font-size:12px;font-weight:700'>📄 {_doc_type}</span>",
+                unsafe_allow_html=True
+            )
+
 st.markdown("---")
+
 
 # ── Document Visuals & Extraction (Multi-Page View) ───────────────────────────
 # We no longer paginate the view. Instead, we render all pages linearly.
@@ -528,22 +878,28 @@ if exec_path == "GENERAL_PHOTO":
             st.warning(f"Image file not found at: `{photo_path}`")
 
     with gp_right:
-        # Extracted Text Display (if any)
-        extracted = current_page.get("extracted_text", "")
-        if extracted:
-            st.subheader("✍ Detected Text")
-            edited = st.text_area(
-                "Text incidental to the image",
-                value=extracted,
-                height=400,
-                key=f"gp_text_{job_id}"
-            )
-            if edited != extracted:
-                ast["pages"][0]["extracted_text"] = edited
-                st.session_state.ast_data = ast
-                st.session_state.is_modified = True
-        else:
-            st.info("No incidental text was detected in this image.")
+        gp_tab_text, gp_tab_qa = st.tabs(["✍ Detected Text", "💬 Ask AI (Q&A)"])
+        
+        with gp_tab_text:
+            # Extracted Text Display (if any)
+            extracted = current_page.get("extracted_text", "")
+            if extracted:
+                st.subheader("✍ Detected Text")
+                edited = st.text_area(
+                    "Text incidental to the image",
+                    value=extracted,
+                    height=400,
+                    key=f"gp_text_{job_id}"
+                )
+                if edited != extracted:
+                    ast["pages"][0]["extracted_text"] = edited
+                    st.session_state.ast_data = ast
+                    st.session_state.is_modified = True
+            else:
+                st.info("No incidental text was detected in this image.")
+        
+        with gp_tab_qa:
+            render_qa_tab(job_id, pages)
 
     # ── Save modifications ──────────────────────────────────────────────
     if st.session_state.is_modified:
@@ -569,7 +925,6 @@ if exec_path == "GENERAL_PHOTO":
             st.warning("Document rejected.")
             st.rerun()
     st.stop()
-
 # ── Confidence indicators ─────────────────────────────────────────────────────
 # For multi-page, display badges of the first page as an overall indicator.
 st.markdown(confidence_badges_html(pages[0]), unsafe_allow_html=True)
@@ -654,7 +1009,9 @@ with col_right:
     a3.metric("Tables Found", num_tables)
     st.markdown("---")
 
-    tab_elements, tab_summary, tab_json, tab_export = st.tabs(["🗂 Elements", "📋 Summary", "{ } Raw JSON", "📥 Export"])
+    tab_elements, tab_summary, tab_qa, tab_json, tab_export = st.tabs([
+        "🗂 Elements", "📋 Summary", "💬 Ask AI", "{ } Raw JSON", "📥 Export"
+    ])
 
     # ── Tab 1: Elements editor ────────────────────────────────────────────────
     with tab_elements:
@@ -874,12 +1231,13 @@ with col_right:
         combined_text = "\n\n".join(page_texts)
 
         doc_type = ast.get("document_type") or meta.get("document_type") or "document"
-        groq_key = os.environ.get("GROQ_API_KEY", "")
+        llm_key = os.environ.get("QWEN_API_KEY") or os.environ.get("GROQ_API_KEY", "")
+        local_url = os.environ.get("LOCAL_MODEL_URL") or os.environ.get("QWEN_LOCAL_URL", "")
 
         if not combined_text.strip():
             st.info("No text content found in the document to summarise.")
-        elif not groq_key:
-            st.error("VLM API KEY (GROQ_API_KEY) not found — cannot generate summary.")
+        elif not llm_key and not local_url:
+            st.error("Qwen 3.6 27B API key or local endpoint not found — cannot generate summary.")
         else:
             sum_col1, sum_col2 = st.columns([3, 1])
             with sum_col2:
@@ -891,9 +1249,9 @@ with col_right:
                 generate_summary.clear()
 
             if cache_key not in st.session_state:
-                with st.spinner("✨ Generating summary via VLM..."):
+                with st.spinner("✨ Generating summary via Qwen 3.6 27B..."):
                     st.session_state[cache_key] = generate_summary(
-                        combined_text, doc_type, groq_key
+                        combined_text, doc_type, llm_key
                     )
 
             summary_md = st.session_state.get(cache_key, "")
@@ -912,7 +1270,11 @@ with col_right:
                 use_container_width=True,
             )
 
-    # ── Tab 3: Raw JSON editor ────────────────────────────────────────────────
+    # ── Tab 3: Ask AI (Q&A) ───────────────────────────────────────────────────
+    with tab_qa:
+        render_qa_tab(job_id, pages)
+
+    # ── Tab 4: Raw JSON editor ────────────────────────────────────────────────
     with tab_json:
         json_str = json.dumps(st.session_state.ast_data, indent=2, ensure_ascii=False)
         edited_json = st.text_area(
@@ -930,7 +1292,7 @@ with col_right:
             except json.JSONDecodeError as e:
                 st.error(f"Invalid JSON: {e}")
 
-    # ── Tab 3: Export ─────────────────────────────────────────────────────────
+    # ── Tab 5: Export ─────────────────────────────────────────────────────────
     with tab_export:
         ast_str = json.dumps(st.session_state.ast_data, indent=2, ensure_ascii=False)
         e1, e2, e3 = st.columns(3)

@@ -1,15 +1,16 @@
-version: "3.9"
 
 # ============================================================
-# Greencare AI — Docker Compose Orchestration
+# Greencare AI — Docker Compose Orchestration  [v2]
 # ============================================================
 # Services:
-#   redis           → Celery message broker + result backend
-#   lego1-gateway   → FastAPI ingest API (port 8000)
-#   lego1-worker    → Celery worker (same code as gateway)
-#   lego2-triage    → CPU fast-track triage (port 8001)
-#   lego3-groq      → Groq Vision extraction engine (port 8002)
-#   lego4-hitl      → Gradio HITL review dashboard (port 7860)
+#   redis             → Celery message broker + result backend
+#   lego1-gateway     → FastAPI ingest API (port 8000)
+#   lego1-worker      → Celery worker (pipeline orchestrator)
+#   lego1-beat        → Celery beat (periodic auto-cleanup scheduler)
+#   lego2-triage      → CPU fast-track triage (port 8001)
+#   lego3-qwen        → Qwen 3.6 27B Vision extraction engine (port 8002)
+#   lego4-hitl        → Gradio HITL review dashboard (port 7860)
+#   lego5-analytics   → Analytics metrics dashboard (port 8003)  [NEW v2]
 # ============================================================
 
 services:
@@ -46,13 +47,17 @@ services:
     environment:
       - REDIS_URL=redis://redis:6379/0
       - LEGO2_URL=http://lego2-triage:8001
-      - LEGO3_URL=http://lego3-groq:8002
-      - GROQ_API_KEY=${GROQ_API_KEY}
+      - LEGO3_URL=http://lego3-qwen:8002
+      - QWEN_API_KEY=${QWEN_API_KEY:-${GROQ_API_KEY}}
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - SECRET_KEY=${SECRET_KEY:-greencare-dev-secret}
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET:-greencare-webhook-secret}
     volumes:
       - shared_uploads:/app/temp_uploads
       - shared_pending:/app/pending_review
       - shared_final:/app/final_database
       - shared_rejected:/app/rejected
+      - shared_webhooks:/app
     depends_on:
       redis:
         condition: service_healthy
@@ -70,21 +75,47 @@ services:
     environment:
       - REDIS_URL=redis://redis:6379/0
       - LEGO2_URL=http://lego2-triage:8001
-      - LEGO3_URL=http://lego3-groq:8002
-      - GROQ_API_KEY=${GROQ_API_KEY}
+      - LEGO3_URL=http://lego3-qwen:8002
+      - QWEN_API_KEY=${QWEN_API_KEY:-${GROQ_API_KEY}}
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET:-greencare-webhook-secret}
+      - UPLOAD_CLEANUP_HOURS=${UPLOAD_CLEANUP_HOURS:-24}
+      - LEGO2_TEMP_CLEANUP_HOURS=${LEGO2_TEMP_CLEANUP_HOURS:-1}
     volumes:
       - shared_uploads:/app/temp_uploads
       - shared_pending:/app/pending_review
       - shared_final:/app/final_database
       - shared_rejected:/app/rejected
       - shared_lego2_temp:/app/lego2_temp
+      - shared_webhooks:/app
     depends_on:
       redis:
         condition: service_healthy
       lego2-triage:
         condition: service_started
-      lego3-groq:
+      lego3-qwen:
         condition: service_started
+
+  # ──────────────────────────────────────────────────────────
+  # Lego 1 — Celery Beat (periodic auto-cleanup scheduler)  [NEW v2]
+  # ──────────────────────────────────────────────────────────
+  lego1-beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: greencare-beat
+    restart: unless-stopped
+    command: celery -A lego1_gateway.worker.celery_app beat --loglevel=info
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - UPLOAD_CLEANUP_HOURS=${UPLOAD_CLEANUP_HOURS:-24}
+      - LEGO2_TEMP_CLEANUP_HOURS=${LEGO2_TEMP_CLEANUP_HOURS:-1}
+    volumes:
+      - shared_uploads:/app/temp_uploads
+      - shared_lego2_temp:/app/lego2_temp
+    depends_on:
+      redis:
+        condition: service_healthy
 
   # ──────────────────────────────────────────────────────────
   # Lego 2 — CPU Triage Service (Port 8001)
@@ -105,42 +136,67 @@ services:
         condition: service_healthy
 
   # ──────────────────────────────────────────────────────────
-  # Lego 3 — Groq Vision Engine (Port 8002)
+  # Lego 3 — Qwen 3.6 27B Vision Engine (Port 8002)
   # ──────────────────────────────────────────────────────────
-  lego3-groq:
+  lego3-qwen:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: greencare-groq
+    container_name: greencare-qwen
     restart: unless-stopped
-    command: uvicorn lego3_groq.groq_engine:app --host 0.0.0.0 --port 8002 --reload
+    command: uvicorn lego3_qwen.qwen_engine:app --host 0.0.0.0 --port 8002 --reload
     ports:
       - "8002:8002"
     environment:
-      - GROQ_API_KEY=${GROQ_API_KEY}
-      - GROQ_MODEL=llama-3.2-90b-vision-preview
-      - GROQ_MAX_TOKENS=4096
+      - QWEN_API_KEY=${QWEN_API_KEY:-${GROQ_API_KEY}}
+      - QWEN_MODEL=${QWEN_MODEL:-${GROQ_MODEL:-qwen/qwen3.6-27b}}
+      - QWEN_MAX_TOKENS=${QWEN_MAX_TOKENS:-${GROQ_MAX_TOKENS:-4096}}
+      - LOCAL_MODEL_URL=${LOCAL_MODEL_URL:-}
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
     volumes:
-      - shared_lego2_temp:/app/lego2_temp    # reads cleaned images from Lego 2
+      - shared_lego2_temp:/app/lego2_temp
 
   # ──────────────────────────────────────────────────────────
-  # Lego 4 — HITL Dashboard (Port 7860)
+  # Lego 4 — HITL Dashboard [DEPRECATED in favor of /web/dashboard.html]
   # ──────────────────────────────────────────────────────────
-  lego4-hitl:
+  # lego4-hitl:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile
+  #   container_name: greencare-hitl
+  #   restart: unless-stopped
+  #   command: python lego4_hitl/hitl_ui.py
+  #   ports:
+  #     - "7860:7860"
+  #   environment:
+  #     - GATEWAY_URL=http://lego1-gateway:8000
+  #   volumes:
+  #     - shared_pending:/app/pending_review
+  #     - shared_final:/app/final_database
+  #     - shared_rejected:/app/rejected
+  #     - shared_uploads:/app/temp_uploads
+  #     - shared_lego2_temp:/app/lego2_temp
+
+  # ──────────────────────────────────────────────────────────
+  # Lego 5 — Analytics Dashboard (Port 8003)  [NEW v2]
+  # ──────────────────────────────────────────────────────────
+  lego5-analytics:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: greencare-hitl
+    container_name: greencare-analytics
     restart: unless-stopped
-    command: python lego4_hitl/hitl_ui.py
+    command: uvicorn lego5_analytics.analytics_service:app --host 0.0.0.0 --port 8003 --reload
     ports:
-      - "7860:7860"
+      - "8003:8003"
+    environment:
+      - PENDING_DIR=/app/pending_review
+      - FINAL_DIR=/app/final_database
+      - REJECTED_DIR=/app/rejected
     volumes:
       - shared_pending:/app/pending_review
       - shared_final:/app/final_database
       - shared_rejected:/app/rejected
-      - shared_uploads:/app/temp_uploads
-      - shared_lego2_temp:/app/lego2_temp
 
 # ──────────────────────────────────────────────────────────
 # Named Volumes (shared between services)
@@ -152,3 +208,4 @@ volumes:
   shared_final:
   shared_rejected:
   shared_lego2_temp:
+  shared_webhooks:

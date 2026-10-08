@@ -1,6 +1,8 @@
 .env
 __pycache__/
 *.pyc
+venv/
+.pytest_cache/
 temp_uploads/
 pending_review/
 final_database/

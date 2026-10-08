@@ -20,7 +20,8 @@ pypdf==4.3.1
 opencv-python-headless==4.10.0.84   # headless = no GUI dependency (server-safe)
 numpy==1.26.4
 
-# ── Groq SDK ─────────────────────────────────────────────────────────────────
+# ── Qwen 3.6 27B / VLM & Inference SDKs ──────────────────────────────────────
+openai>=1.20.0
 groq==0.9.0
 
 # ── HITL Dashboard ────────────────────────────────────────────────────────────
@@ -28,3 +29,29 @@ gradio==4.37.2
 
 # ── Data Validation ───────────────────────────────────────────────────────────
 pydantic==2.7.4
+
+# ── Word Document Extraction ──────────────────────────────────────────────────
+python-docx>=1.1.2           # primary .docx extractor
+mammoth>=1.6.0               # fallback .docx extractor for complex/protected files
+
+# ── OCR & DB Analysis (Phase 6 additions) ─────────────────────────────────────
+pytesseract>=0.3.10          # Tesseract OCR engine wrapper
+pyvis>=0.3.2                 # Interactive network graph for ER diagrams
+networkx>=3.0                # Graph analysis
+pillow>=10.0                 # Image handling for OCR preprocessing
+
+# ── Excel Read/Write ──────────────────────────────────────────────────────────
+openpyxl>=3.1.2             # xlsx read/write (Lego 2 triage + analytics export)
+
+# ── Async HTTP Client ─────────────────────────────────────────────────────────
+httpx>=0.27.0               # async webhook dispatch from Celery worker
+
+# ── JWT Auth ──────────────────────────────────────────────────────────────────
+python-jose[cryptography]>=3.3.0   # JWT token creation/validation
+
+# ── Analytics / Charting ─────────────────────────────────────────────────────
+pandas>=2.0.0               # already implied by HITL; pin explicitly
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+pytest>=8.0
+pytest-mock>=3.12

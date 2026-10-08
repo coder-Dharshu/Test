@@ -25,6 +25,11 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+# Disable mkldnn and pir flags for PaddleOCR stability on Windows
+os.environ["FLAGS_use_mkldnn"] = "0"
+os.environ["FLAGS_enable_pir_api"] = "0"
+os.environ["PADDLE_USE_PIR_API"] = "0"
+
 # ── Load .env ──────────────────────────────────────────────────────────────
 BASE = os.path.dirname(os.path.abspath(__file__))
 env_path = os.path.join(BASE, ".env")
@@ -36,9 +41,10 @@ if os.path.exists(env_path):
                 k, v = line.split("=", 1)
                 os.environ.setdefault(k.strip(), v.strip())
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-if not GROQ_API_KEY:
-    print("❌  GROQ_API_KEY not set. Please add it to .env")
+QWEN_API_KEY = os.environ.get("QWEN_API_KEY") or os.environ.get("GROQ_API_KEY", "")
+LOCAL_MODEL_URL = os.environ.get("LOCAL_MODEL_URL") or os.environ.get("QWEN_LOCAL_URL", "")
+if not QWEN_API_KEY and not LOCAL_MODEL_URL:
+    print("❌  QWEN_API_KEY / GROQ_API_KEY or LOCAL_MODEL_URL not set. Please configure .env")
     sys.exit(1)
 
 PYTHON = sys.executable
@@ -53,8 +59,8 @@ SERVICES = [
         "color"  : "\033[94m",
     },
     {
-        "name"   : "Lego3-VLM-Engine",
-        "cmd"    : [PYTHON, "-m", "uvicorn", "lego3_groq.groq_engine:app",
+        "name"   : "Lego3-Qwen-Engine",
+        "cmd"    : [PYTHON, "-m", "uvicorn", "lego3_qwen.qwen_engine:app",
                     "--host", "0.0.0.0", "--port", "8002"],
         "health" : "http://localhost:8002/health",
         "color"  : "\033[95m",
@@ -149,7 +155,7 @@ def main():
     print(f"{BOLD}[LIVE] Greencare AI — Smart Triage is running!{RESET}")
     print(f"  [1] API Gateway      --> http://localhost:8000/docs")
     print(f"  [2] CPU Triage       --> http://localhost:8001/docs")
-    print(f"  [3] VLM Engine       --> http://localhost:8002/docs")
+    print(f"  [3] Qwen 3.6 27B     --> http://localhost:8002/docs")
     print(f"  [4] HITL Dashboard   --> http://localhost:8501  (Streamlit)")
     print(f"{BOLD}{'=' * 55}{RESET}")
     print("\nPress Ctrl+C to stop all services.\n")
