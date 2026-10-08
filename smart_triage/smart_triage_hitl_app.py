@@ -62,7 +62,7 @@ except ImportError:
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title   = "Smart Triage IDP — HITL Hub",
+    page_title   = "PROG-OCR — HITL Hub",
     page_icon    = "🛡",
     layout       = "wide",
     initial_sidebar_state = "expanded",
@@ -339,13 +339,14 @@ def upload_file(uploaded_file):
             f"{GATEWAY_URL}/api/v1/ingest",
             files={"file": (uploaded_file.name, uploaded_file.getvalue())},
             timeout=30,
+            proxies={"http": None, "https": None},
         )
         resp.raise_for_status()
         job_id = resp.json().get("job_id", "?")
         
         with st.spinner(f"Processing job {job_id}... Please wait for extraction to complete."):
-            # Active polling loop with 45-second timeout fail-safe
-            max_retries = 45
+            # Active polling loop with 300-second timeout fail-safe for slow CPU OCR
+            max_retries = 300
             poll_interval = 1
             expected_file = None
             
@@ -381,11 +382,33 @@ def upload_file(uploaded_file):
     except Exception as e:
         st.session_state.upload_msg = f"❌ Upload failed: {e}"
 
+# ── Auto-load first pending file if none loaded ──────────────────────────────
+pending_files = get_pending_files()
+if st.session_state.current_file is None and pending_files:
+    first_pending = pending_files[0]
+    data = load_ast(first_pending)
+    if data:
+        st.session_state.current_file     = first_pending
+        st.session_state.ast_data         = data
+        st.session_state.is_modified      = False
+        st.session_state.current_page_idx = 0
+elif st.session_state.current_file is not None and not Path(st.session_state.current_file).exists():
+    st.session_state.current_file = None
+    st.session_state.ast_data = None
+    st.session_state.is_modified = False
+    st.session_state.current_page_idx = 0
+    if pending_files:
+        first_pending = pending_files[0]
+        data = load_ast(first_pending)
+        if data:
+            st.session_state.current_file     = first_pending
+            st.session_state.ast_data         = data
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # SIDEBAR
 # ═══════════════════════════════════════════════════════════════════════════════
 with st.sidebar:
-    st.markdown("## 🛡 Smart Triage IDP")
+    st.markdown("## 🛡 PROG-OCR")
     st.markdown("---")
 
     stats = queue_stats()
@@ -406,34 +429,6 @@ with st.sidebar:
     </div>
     """, unsafe_allow_html=True)
 
-    st.markdown("**Select Document**")
-    pending_names = get_pending_names()
-    if not pending_names:
-        st.info("Queue is empty. Upload a document above.")
-    else:
-        selected = st.selectbox("Pending Documents", pending_names, label_visibility="collapsed")
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("📂 Load", use_container_width=True):
-                fp = PENDING_DIR / selected
-                data = load_ast(fp)
-                if data:
-                    st.session_state.current_file     = fp
-                    st.session_state.ast_data         = data
-                    st.session_state.is_modified      = False
-                    st.session_state.current_page_idx = 0
-                    st.rerun()
-        with col2:
-            if st.button("🗑️ Delete", use_container_width=True):
-                fp = PENDING_DIR / selected
-                fp.unlink(missing_ok=True)
-                if st.session_state.current_file == fp:
-                    st.session_state.current_file = None
-                    st.session_state.ast_data = None
-                st.rerun()
-
-    st.markdown("---")
     st.markdown("**Upload New Document**")
     uploaded = st.file_uploader(
         "Choose file",
@@ -448,9 +443,20 @@ with st.sidebar:
         st.markdown(st.session_state.upload_msg)
 
     st.markdown("---")
+    if st.session_state.current_file:
+        if st.button("🗑️ Delete Active Document", use_container_width=True):
+            fp = Path(st.session_state.current_file)
+            fp.unlink(missing_ok=True)
+            st.session_state.current_file = None
+            st.session_state.ast_data = None
+            st.session_state.is_modified = False
+            st.session_state.current_page_idx = 0
+            st.rerun()
+        st.markdown("---")
+
     col3, col4 = st.columns(2)
     with col3:
-        if st.button("🔄 Refresh", use_container_width=True):
+        if st.button("🔄 Refresh Queue", use_container_width=True):
             st.rerun()
     with col4:
         if st.button("🗑️ Clear All", use_container_width=True):
@@ -458,6 +464,8 @@ with st.sidebar:
                 f.unlink(missing_ok=True)
             st.session_state.current_file = None
             st.session_state.ast_data = None
+            st.session_state.is_modified = False
+            st.session_state.current_page_idx = 0
             st.rerun()
 
     # ── DB Relationship Analyzer ──────────────────────────────────────────────

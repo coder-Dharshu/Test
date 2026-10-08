@@ -495,6 +495,7 @@ async def triage_document(file: UploadFile = File(...)):
     elif ext in IMAGE_EXT:
         processed = deskew_image(dest_path)
         processed = apply_glare_suppression(processed)
+        processed = binarize_image(processed)   # strip colour before VLM
         return {
             "routing":           "forward_to_vlm",
             "cleaned_file_path": processed,
