@@ -1,8 +1,13 @@
+# Git ignore rules for Greencare AI / Pramaan IDP
 .env
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
 venv/
 .pytest_cache/
+*.log
+
+# Data directories (transient processing data)
 temp_uploads/
 pending_review/
 final_database/
@@ -10,8 +15,16 @@ rejected/
 lego2_temp/
 extracted_assets/
 exports/
-*.json
+audit/
+
+# Temporary and state files
+*.tmp
+webhook_registry.json
+idempotency_store.json
+
+# Keep schemas and templates
+!schemas/*.json
 !.env.example
 !docker-compose.yml
 !requirements.txt
-.structure
+!.structure

@@ -8,8 +8,7 @@
 #   lego1-worker      → Celery worker (pipeline orchestrator)
 #   lego1-beat        → Celery beat (periodic auto-cleanup scheduler)
 #   lego2-triage      → CPU fast-track triage (port 8001)
-#   lego3-qwen        → Qwen 3.6 27B Vision extraction engine (port 8002)
-#   lego4-hitl        → Gradio HITL review dashboard (port 7860)
+#   smart_triage      → Streamlit HITL review dashboard (port 8501)
 #   lego5-analytics   → Analytics metrics dashboard (port 8003)  [NEW v2]
 # ============================================================
 
@@ -48,8 +47,12 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - LEGO2_URL=http://lego2-triage:8001
       - LEGO3_URL=http://lego3-qwen:8002
-      - QWEN_API_KEY=${QWEN_API_KEY:-${GROQ_API_KEY}}
+      - INFERENCE_BACKEND=${INFERENCE_BACKEND:-groq}
+      - ALLOW_CLOUD_ESCALATION=${ALLOW_CLOUD_ESCALATION:-true}
       - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - QWEN_API_KEY=${QWEN_API_KEY:-${GROQ_API_KEY}}
+      - LOCAL_MODEL_URL=${LOCAL_MODEL_URL:-http://ollama:11434/v1}
+      - LOCAL_MODEL_NAME=${LOCAL_MODEL_NAME:-qwen3.6:27b}
       - SECRET_KEY=${SECRET_KEY:-greencare-dev-secret}
       - WEBHOOK_SECRET=${WEBHOOK_SECRET:-greencare-webhook-secret}
     volumes:
@@ -76,8 +79,12 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - LEGO2_URL=http://lego2-triage:8001
       - LEGO3_URL=http://lego3-qwen:8002
-      - QWEN_API_KEY=${QWEN_API_KEY:-${GROQ_API_KEY}}
+      - INFERENCE_BACKEND=${INFERENCE_BACKEND:-groq}
+      - ALLOW_CLOUD_ESCALATION=${ALLOW_CLOUD_ESCALATION:-true}
       - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - QWEN_API_KEY=${QWEN_API_KEY:-${GROQ_API_KEY}}
+      - LOCAL_MODEL_URL=${LOCAL_MODEL_URL:-http://ollama:11434/v1}
+      - LOCAL_MODEL_NAME=${LOCAL_MODEL_NAME:-qwen3.6:27b}
       - WEBHOOK_SECRET=${WEBHOOK_SECRET:-greencare-webhook-secret}
       - UPLOAD_CLEANUP_HOURS=${UPLOAD_CLEANUP_HOURS:-24}
       - LEGO2_TEMP_CLEANUP_HOURS=${LEGO2_TEMP_CLEANUP_HOURS:-1}
@@ -148,37 +155,57 @@ services:
     ports:
       - "8002:8002"
     environment:
+      - INFERENCE_BACKEND=${INFERENCE_BACKEND:-groq}
+      - ALLOW_CLOUD_ESCALATION=${ALLOW_CLOUD_ESCALATION:-true}
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
       - QWEN_API_KEY=${QWEN_API_KEY:-${GROQ_API_KEY}}
       - QWEN_MODEL=${QWEN_MODEL:-${GROQ_MODEL:-qwen/qwen3.6-27b}}
       - QWEN_MAX_TOKENS=${QWEN_MAX_TOKENS:-${GROQ_MAX_TOKENS:-4096}}
-      - LOCAL_MODEL_URL=${LOCAL_MODEL_URL:-}
-      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - LOCAL_MODEL_URL=${LOCAL_MODEL_URL:-http://ollama:11434/v1}
+      - LOCAL_MODEL_NAME=${LOCAL_MODEL_NAME:-qwen3.6:27b}
     volumes:
       - shared_lego2_temp:/app/lego2_temp
 
   # ──────────────────────────────────────────────────────────
-  # Lego 4 — HITL Dashboard [DEPRECATED in favor of /web/dashboard.html]
+  # Local Ollama Inference (Enabled via: docker compose --profile local up)
   # ──────────────────────────────────────────────────────────
-  # lego4-hitl:
-  #   build:
-  #     context: .
-  #     dockerfile: Dockerfile
-  #   container_name: greencare-hitl
-  #   restart: unless-stopped
-  #   command: python lego4_hitl/hitl_ui.py
-  #   ports:
-  #     - "7860:7860"
-  #   environment:
-  #     - GATEWAY_URL=http://lego1-gateway:8000
-  #   volumes:
-  #     - shared_pending:/app/pending_review
-  #     - shared_final:/app/final_database
-  #     - shared_rejected:/app/rejected
-  #     - shared_uploads:/app/temp_uploads
-  #     - shared_lego2_temp:/app/lego2_temp
+  ollama:
+    image: ollama/ollama:latest
+    container_name: greencare-ollama
+    profiles:
+      - local
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
 
   # ──────────────────────────────────────────────────────────
-  # Lego 5 — Analytics Dashboard (Port 8003)  [NEW v2]
+  # Smart Triage — Streamlit HITL Dashboard (Port 8501)
+  # ──────────────────────────────────────────────────────────
+  smart_triage:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: greencare-hitl-streamlit
+    restart: unless-stopped
+    command: streamlit run smart_triage/smart_triage_hitl_app.py --server.port 8501 --server.address 0.0.0.0 --server.headless true
+    ports:
+      - "8501:8501"
+    environment:
+      - GATEWAY_URL=http://lego1-gateway:8000
+      - PENDING_DIR=/app/pending_review
+      - FINAL_DIR=/app/final_database
+      - REJECTED_DIR=/app/rejected
+      - AUDIT_DIR=/app/audit
+    volumes:
+      - shared_pending:/app/pending_review
+      - shared_final:/app/final_database
+      - shared_rejected:/app/rejected
+      - shared_uploads:/app/temp_uploads
+      - shared_lego2_temp:/app/lego2_temp
+
+  # ──────────────────────────────────────────────────────────
+  # Lego 5 — Analytics Dashboard (Port 8003)
   # ──────────────────────────────────────────────────────────
   lego5-analytics:
     build:
@@ -209,3 +236,4 @@ volumes:
   shared_rejected:
   shared_lego2_temp:
   shared_webhooks:
+  ollama_data:

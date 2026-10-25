@@ -547,9 +547,11 @@ def crop_visual_assets(source_image_path: str, grounding_results: list, job_id: 
             continue
 
         x_min, y_min, x_max, y_max = [int(c) for c in box]
-        x_min = max(0, x_min); y_min = max(0, y_min)
-        x_max = min(img_w, x_max); y_max = min(img_h, y_max)
-        crop  = image[y_min:y_max, x_min:x_max]
+        x_min = max(0, x_min)
+        y_min = max(0, y_min)
+        x_max = min(img_w, x_max)
+        y_max = min(img_h, y_max)
+        crop = image[y_min:y_max, x_min:x_max]
         if crop.size == 0:
             continue
 

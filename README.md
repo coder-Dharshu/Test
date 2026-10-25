@@ -62,10 +62,10 @@ A production-ready, **five-microservice** IDP pipeline that uses a **local Qwen 
                                │  JSON + timestamps written
                                ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│  LEGO 4 — HITL Dashboard v2  (port 7860)                        │
-│  • Gradio web UI with tabbed layout (Review / Statistics / Help) │
-│  • Queue search / filter   •  Keyboard shortcuts (A / R / N)    │
-│  • PDF-to-image preview    •  Processing timestamp display       │
+│  Smart Triage — HITL Dashboard  (port 8501)                      │
+│  • Streamlit Web UI with full AST visualization & inspection     │
+│  • Bounding box overlay    •  Confidence scoring & metrics       │
+│  • Multi-page navigation   •  Document summary                   │
 │  • Approve → final_database/  |  Reject → rejected/             │
 │  • Export JSON / CSV / Excel                                     │
 └──────────────────────────────────────────────────────────────────┘
@@ -116,8 +116,7 @@ First build takes ~3–5 minutes. Subsequent starts are instant.
 |---|---|
 | 🚪 API Gateway (Swagger UI) | http://localhost:8000/docs |
 | 🔍 CPU Triage (Swagger UI) | http://localhost:8001/docs |
-| 🤖 VLM Vision (Swagger UI) | http://localhost:8002/docs |
-| 👁 HITL Dashboard | http://localhost:7860 |
+| 👁 HITL Dashboard | http://localhost:8501 |
 | 📊 Analytics Dashboard | http://localhost:8003/metrics/dashboard |
 
 ---
@@ -146,7 +145,7 @@ celery -A lego1_gateway.worker.celery_app beat --loglevel=info
 
 # Terminal 5 — Gateway + HITL + Analytics
 uvicorn lego1_gateway.main:app --port 8000 --reload
-python lego4_hitl/hitl_ui.py
+streamlit run smart_triage/smart_triage_hitl_app.py --server.port 8501
 uvicorn lego5_analytics.analytics_service:app --port 8003 --reload
 ```
 
@@ -324,13 +323,11 @@ greencare-ai/
 ├── lego3_qwen/
 │   └── qwen_engine.py             # Qwen 3.6 27B Vision Engine v2
 │
-├── lego4_hitl/
-│   └── hitl_ui.py                 # HITL Dashboard v2 (Gradio)
-│
 ├── lego5_analytics/               # [NEW v2]
 │   └── analytics_service.py       # Analytics metrics service (port 8003)
 │
-├── smart_triage/                  # Advanced orchestrator (SmartTriage)
+├── smart_triage/                  # Advanced orchestrator & Streamlit HITL Hub
+│   ├── smart_triage_hitl_app.py   # Streamlit HITL Dashboard (port 8501)
 │   ├── orchestrator.py
 │   ├── ast_compiler.py
 │   ├── ocr_engine.py

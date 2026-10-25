@@ -87,6 +87,14 @@ SERVICES = [
         "health" : "http://localhost:8501/healthz",
         "color"  : "\033[93m",
     },
+    {
+        "name"   : "Lego5-Analytics-Dashboard",
+        "cmd"    : [PYTHON, "-m", "uvicorn", "lego5_analytics.analytics_service:app",
+            "--host", "0.0.0.0", "--port", "8003"],
+        "port"   : 8003,
+        "health" : "http://localhost:8003/health",
+        "color"  : "\033[96m",
+    },
 ]
 
 RESET = "\033[0m"
@@ -261,13 +269,19 @@ def main():
         processes.append(proc)
         time.sleep(3)
 
-    print(f"\n{BOLD}{'=' * 55}{RESET}")
-    print(f"{BOLD}[LIVE] Greencare AI — Smart Triage is running!{RESET}")
-    print(f"  [1] API Gateway      --> http://localhost:8000/docs")
-    print(f"  [2] CPU Triage       --> http://localhost:8001/docs")
-    print(f"  [3] Qwen 3.6 27B     --> http://localhost:8002/docs")
-    print(f"  [4] HITL Dashboard   --> http://localhost:8501  (Streamlit)")
-    print(f"{BOLD}{'=' * 55}{RESET}")
+    from config import config as _cfg
+    print(f"\n{BOLD}{'=' * 65}{RESET}")
+    print(f"{BOLD}🌿 IDP (Greencare AI / Pramaan) — Cluster Running!{RESET}")
+    print(f"  Backend        : {BOLD}{_cfg.INFERENCE_BACKEND.upper()}{RESET}")
+    print(f"  Model          : {BOLD}{_cfg.LOCAL_MODEL_NAME if _cfg.INFERENCE_BACKEND == 'local' else _cfg.QWEN_MODEL}{RESET}")
+    print(f"  Cloud Allowed  : {BOLD}{_cfg.ALLOW_CLOUD_ESCALATION}{RESET}")
+    print(f"{'-' * 65}")
+    print("  [1] API Gateway      --> http://localhost:8000/docs")
+    print("  [2] CPU Triage       --> http://localhost:8001/docs")
+    print("  [3] Vision Engine    --> http://localhost:8002/docs")
+    print("  [4] Analytics Hub    --> http://localhost:8003/metrics/dashboard")
+    print("  [5] HITL Dashboard   --> http://localhost:8501 (Streamlit Hub)")
+    print(f"{BOLD}{'=' * 65}{RESET}")
     print("\nPress Ctrl+C to stop all services.\n")
 
     # Auto-open dashboards after a delay

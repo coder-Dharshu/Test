@@ -1,0 +1,9 @@
+filename,doc_type,path_taken,latency_ms,ocr_confidence,vlm_tokens,validation_attempts,est_cost_usd,final_status
+01_digital_invoice.pdf,PDF,FAILED,657.42,0.0,0,1,0.0,ERROR: ValueError
+02_service_agreement.pdf,PDF,FAILED,195.98,0.0,0,1,0.0,ERROR: ValueError
+03_clean_scanned_receipt.jpg,IMAGE,Track B Path 2 (VLM Escalation),8580.93,0.0,520,1,0.000104,COMMITTED
+04_degraded_mobile_photo.jpg,IMAGE,Track B Path 2 (VLM Escalation),8849.62,0.0,520,1,0.000104,COMMITTED
+05_quarterly_report.docx,DOCX,Track A (Fast-Track),116.68,100.0,0,1,0.0,COMMITTED
+06_financial_ledger.xlsx,XLSX,Track A (Fast-Track),762.15,100.0,0,1,0.0,COMMITTED
+07_inventory_export.csv,CSV,Track A (Fast-Track),25.41,100.0,0,1,0.0,COMMITTED
+08_corrupted_payload.pdf,PDF,REJECTED,18.7,0.0,0,1,0.0,ERROR_HANDLED

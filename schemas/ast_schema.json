@@ -1,0 +1,83 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "DoclingASTDocument",
+  "description": "Standardized Abstract Syntax Tree (AST) Document Schema for IDP",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "document_metadata",
+    "pipeline_metadata",
+    "pages"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "enum": ["2.0.0"]
+    },
+    "document_metadata": {
+      "type": "object",
+      "required": ["doc_id", "source_filename", "total_pages", "processed_timestamp", "pipeline", "execution_path"],
+      "properties": {
+        "doc_id": { "type": "string" },
+        "source_filename": { "type": "string" },
+        "total_pages": { "type": "integer", "minimum": 1 },
+        "processed_timestamp": { "type": "string" },
+        "pipeline": { "type": "string" },
+        "execution_path": { "type": "string" },
+        "pcs_score": { "type": ["number", "null"] },
+        "pcs_breakdown": { "type": ["object", "null"] }
+      }
+    },
+    "pipeline_metadata": {
+      "type": "object",
+      "required": ["backend", "model_id"],
+      "properties": {
+        "backend": { "type": "string" },
+        "model_id": { "type": "string" },
+        "ocr_strategy": { "type": ["string", "null"] },
+        "vlm_tokens": { "type": ["integer", "null"] },
+        "validation_attempts": { "type": "integer" },
+        "request_id": { "type": "string" }
+      }
+    },
+    "pages": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["page_index", "page_number", "execution_path", "elements"],
+        "properties": {
+          "page_index": { "type": "integer", "minimum": 0 },
+          "page_number": { "type": "integer", "minimum": 1 },
+          "execution_path": { "type": "string" },
+          "pcs_score": { "type": ["number", "null"] },
+          "document_type": { "type": "string" },
+          "language": { "type": "string" },
+          "dimensions": {
+            "type": "object",
+            "properties": {
+              "width": { "type": "number" },
+              "height": { "type": "number" }
+            }
+          },
+          "elements": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["element_id", "type", "content", "confidence"],
+              "properties": {
+                "element_id": { "type": "string" },
+                "type": { "type": "string", "enum": ["text", "paragraph", "heading", "key_value", "table", "graphic"] },
+                "bbox": {
+                  "type": "array",
+                  "items": { "type": "number" }
+                },
+                "confidence": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                "content": { "type": "object" }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

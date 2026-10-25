@@ -36,10 +36,14 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Optional backends — graceful degradation
 # ---------------------------------------------------------------------------
+import shutil
+
 try:
     import pytesseract
     from pytesseract import Output as TessOutput
-    TESSERACT_AVAILABLE = True
+    TESSERACT_AVAILABLE = (shutil.which("tesseract") is not None)
+    if not TESSERACT_AVAILABLE:
+        logger.info("tesseract binary not found on system PATH — OCR will use EasyOCR fallback.")
 except ImportError:
     TESSERACT_AVAILABLE = False
     logger.warning("pytesseract not installed — OCR will use EasyOCR fallback only.")
@@ -303,17 +307,9 @@ class MultiStrategyOCREngine:
         easyocr_reader: Optional pre-initialized EasyOCR reader (avoids re-init).
     """
 
-    # Default strategy cascade — ordered from fastest/cheapest to slowest/most aggressive
+    # Default strategy cascade — single high-yield strategy for fast sub-8s response times
     DEFAULT_STRATEGY_CASCADE = [
         PreprocessingStrategy.GRAYSCALE_ADAPTIVE,
-        PreprocessingStrategy.CLAHE_ADAPTIVE,
-        PreprocessingStrategy.GRAYSCALE_OTSU,
-        PreprocessingStrategy.BILATERAL_ADAPTIVE,
-        PreprocessingStrategy.CLAHE_OTSU,
-        PreprocessingStrategy.MORPHOLOGICAL,
-        PreprocessingStrategy.DPI_ENHANCE_OTSU,
-        PreprocessingStrategy.DESKEW_ADAPTIVE,
-        PreprocessingStrategy.INVERT_ADAPTIVE,
     ]
 
     def __init__(
@@ -397,7 +393,12 @@ class MultiStrategyOCREngine:
     ) -> OCRResult:
         """Run OCR on a preprocessed grayscale image using available backend."""
         if TESSERACT_AVAILABLE:
-            return self._run_tesseract(processed, strategy, t_start)
+            try:
+                return self._run_tesseract(processed, strategy, t_start)
+            except Exception as t_err:
+                if EASYOCR_AVAILABLE:
+                    return self._run_easyocr(processed, strategy, t_start)
+                raise t_err
         elif EASYOCR_AVAILABLE:
             return self._run_easyocr(processed, strategy, t_start)
         else:
@@ -455,7 +456,15 @@ class MultiStrategyOCREngine:
             import easyocr as _easyocr
             self._easyocr_reader = _easyocr.Reader(["en"], gpu=False)
 
-        results = self._easyocr_reader.readtext(processed, detail=1)
+        h, w = processed.shape[:2]
+        max_dim = 1024
+        if max(h, w) > max_dim:
+            scale = max_dim / max(h, w)
+            processed_ocr = cv2.resize(processed, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+        else:
+            processed_ocr = processed
+
+        results = self._easyocr_reader.readtext(processed_ocr, detail=1, batch_size=4)
         texts, confs = [], []
         for (_bbox, text, conf) in results:
             if text.strip() and conf > 0.1:

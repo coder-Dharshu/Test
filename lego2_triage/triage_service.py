@@ -78,11 +78,23 @@ CSV_EXT        = ".csv"
 MIN_TEXT_CHARS = 50
 
 
+def safe_imread(path: str):
+    try:
+        data = np.fromfile(path, dtype=np.uint8)
+        if data is not None and len(data) > 0:
+            img = cv2.imdecode(data, cv2.IMREAD_COLOR)
+            if img is not None:
+                return img
+    except Exception:
+        pass
+    return cv2.imread(path)
+
+
 # ---------------------------------------------------------------------------
 # §5 Specular Glare Suppression Filter
 # ---------------------------------------------------------------------------
 def apply_glare_suppression(image_path: str) -> str:
-    image = cv2.imread(image_path)
+    image = safe_imread(image_path)
     if image is None:
         logger.warning("Cannot read image for glare suppression: %s", image_path)
         return image_path
@@ -98,15 +110,23 @@ def apply_glare_suppression(image_path: str) -> str:
     mask    = cv2.dilate(mask, kernel, iterations=2)
     cleaned = cv2.inpaint(image, mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
 
-    lab     = cv2.cvtColor(cleaned, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    clahe   = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    l       = clahe.apply(l)
-    cleaned = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
+    lab = cv2.cvtColor(cleaned, cv2.COLOR_BGR2LAB)
+    l_chan, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l_chan = clahe.apply(l_chan)
+    cleaned = cv2.cvtColor(cv2.merge([l_chan, a, b]), cv2.COLOR_LAB2BGR)
 
-    base, ext  = os.path.splitext(image_path)
+    base, ext = os.path.splitext(image_path)
     clean_path = f"{base}_glare_clean{ext}"
-    cv2.imwrite(clean_path, cleaned)
+    try:
+        ext_clean = ext if ext else ".png"
+        is_success, buf = cv2.imencode(ext_clean, cleaned)
+        if is_success:
+            buf.tofile(clean_path)
+        else:
+            cv2.imwrite(clean_path, cleaned)
+    except Exception:
+        cv2.imwrite(clean_path, cleaned)
     logger.info("Glare suppression → %s", clean_path)
     return clean_path
 
@@ -115,7 +135,7 @@ def apply_glare_suppression(image_path: str) -> str:
 # Deskew correction
 # ---------------------------------------------------------------------------
 def deskew_image(image_path: str) -> str:
-    image = cv2.imread(image_path)
+    image = safe_imread(image_path)
     if image is None:
         return image_path
 
@@ -144,6 +164,25 @@ def deskew_image(image_path: str) -> str:
     cv2.imwrite(deskew_path, result)
     logger.info("Deskewed (%.2f°) → %s", angle, deskew_path)
     return deskew_path
+
+
+# ---------------------------------------------------------------------------
+# Binarize image
+# ---------------------------------------------------------------------------
+def binarize_image(image_path: str) -> str:
+    image = safe_imread(image_path)
+    if image is None:
+        return image_path
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    binarized = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 8
+    )
+    base, ext = os.path.splitext(image_path)
+    bin_path = f"{base}_binarized{ext}"
+    cv2.imwrite(bin_path, binarized)
+    logger.info("Binarized → %s", bin_path)
+    return bin_path
 
 
 # ---------------------------------------------------------------------------

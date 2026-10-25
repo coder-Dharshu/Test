@@ -1,0 +1,50 @@
+greencare-ai/
+├── .github/
+│   └── workflows/
+│       └── ci.yml                     # GitHub Actions CI workflow (Ruff lint + Pytest suite)
+├── Dockerfile
+├── docker-compose.yml                 # Multi-profile compose: cloud (Groq) & local (Ollama)
+├── requirements.txt
+├── .env.example                       # Complete documented environment template
+├── .gitignore                         # Ephemeral & local directory exclusions
+├── README.md
+├── run_all.py                         # Master launcher with startup banner & port sanity check
+├── config.py                          # Centralized Pydantic application configuration & validation
+├── webhook_registry.json              # Webhook endpoint subscriptions with HMAC secrets
+├── audit/                             # Audit logging & active learning directory
+│   ├── audit_log.jsonl                # Reviewer action trails (approve/reject/reason)
+│   └── corrections.jsonl              # Pre-edit vs post-edit operator correction pairs
+├── common/
+│   ├── __init__.py
+│   └── errors.py                      # Standardized IDP error taxonomy & API error responses
+├── schemas/
+│   └── ast_schema.json                # Formal JSON Schema Draft-07 for Docling AST output
+├── scripts/
+│   └── benchmark.py                   # Reproducible performance & accuracy benchmark runner
+├── benchmark_results.md               # Empirical benchmark report across document formats
+├── benchmark_results.csv              # Raw telemetry from benchmark executions
+├── lego1_gateway/
+│   ├── main.py                        # FastAPI Gateway (port 8000) with Celery & async queues
+│   ├── main_standalone.py             # Standalone Gateway (port 8000) — no Redis required
+│   └── worker.py                      # Celery worker — pipeline dispatch & beat auto-cleanup
+├── lego2_triage/
+│   └── triage_service.py              # CPU Triage microservice (port 8001)
+├── lego3_qwen/
+│   └── qwen_engine.py                 # Unified OpenAI-compatible VLM engine (port 8002)
+├── lego5_analytics/
+│   └── analytics_service.py           # Analytics metrics & health dashboard (port 8003)
+├── smart_triage/
+│   ├── __init__.py
+│   ├── smart_triage_hitl_app.py       # Streamlit HITL review dashboard (port 8501)
+│   ├── orchestrator.py                # Core triage & execution director (Tracks A, B, C)
+│   ├── ast_compiler.py                # Docling AST compiler (schema_version 2.0.0 & confidence)
+│   ├── ocr_engine.py                  # Multi-strategy OCR cascade with early exit & EasyOCR fallback
+│   └── db_analyzer.py                 # SQLite & Pandas schema inference engine
+└── tests/
+    ├── conftest.py                    # Shared pytest fixtures, isolated temp dirs & mocks
+    ├── test_production_hardening.py   # 12-point hardening & compliance test suite
+    ├── test_gateway_v2.py             # Ingestion, search, batching, and webhook tests
+    ├── test_classification.py         # 7-stage text density & routing tests
+    ├── test_db_analyzer.py            # Database analyzer schema tests
+    ├── test_excel_sheets.py           # Spreadsheet multi-sheet extraction tests
+    └── test_ocr_engine.py             # OCR engine unit tests

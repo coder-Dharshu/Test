@@ -22,9 +22,11 @@ import glob
 import json
 import io
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import requests
 import streamlit as st
 import pandas as pd
 try:
@@ -151,26 +153,40 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ── Directory config ──────────────────────────────────────────────────────────
-BASE_DIR     = Path(__file__).parent.parent
-PENDING_DIR  = BASE_DIR / "pending_review"
-FINAL_DIR    = BASE_DIR / "final_database"
-REJECTED_DIR = BASE_DIR / "rejected"
-UPLOAD_DIR   = BASE_DIR / "temp_uploads"
-LEGO2_TEMP   = BASE_DIR / "lego2_temp"
-EXPORTS_DIR  = BASE_DIR / "exports"
-GATEWAY_URL  = os.environ.get("GATEWAY_URL", "http://127.0.0.1:8000")
+BASE_DIR         = Path(__file__).parent.parent
+PENDING_DIR      = BASE_DIR / "pending_review"
+FINAL_DIR        = BASE_DIR / "final_database"
+REJECTED_DIR     = BASE_DIR / "rejected"
+UPLOAD_DIR       = BASE_DIR / "temp_uploads"
+LEGO2_TEMP       = BASE_DIR / "lego2_temp"
+EXPORTS_DIR      = BASE_DIR / "exports"
+AUDIT_DIR        = BASE_DIR / "audit"
+AUDIT_LOG_FILE   = AUDIT_DIR / "audit_log.jsonl"
+CORRECTIONS_FILE = AUDIT_DIR / "corrections.jsonl"
+GATEWAY_URL      = os.environ.get("GATEWAY_URL", "http://127.0.0.1:8000")
 
-for d in [PENDING_DIR, FINAL_DIR, REJECTED_DIR, EXPORTS_DIR]:
+for d in [PENDING_DIR, FINAL_DIR, REJECTED_DIR, EXPORTS_DIR, AUDIT_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 # ── Session state defaults ────────────────────────────────────────────────────
-if "current_file"       not in st.session_state: st.session_state.current_file       = None
-if "ast_data"           not in st.session_state: st.session_state.ast_data           = None
-if "is_modified"        not in st.session_state: st.session_state.is_modified        = False
-if "current_page_idx"   not in st.session_state: st.session_state.current_page_idx   = 0
-if "upload_msg"         not in st.session_state: st.session_state.upload_msg         = ""
-if "selected_sheet_idx" not in st.session_state: st.session_state.selected_sheet_idx = 0  # Excel multi-sheet selector
-if "db_analysis_result" not in st.session_state: st.session_state.db_analysis_result = None  # DB ER result
+if "current_file" not in st.session_state:
+    st.session_state.current_file = None
+if "ast_data" not in st.session_state:
+    st.session_state.ast_data = None
+if "is_modified" not in st.session_state:
+    st.session_state.is_modified = False
+if "current_page_idx" not in st.session_state:
+    st.session_state.current_page_idx = 0
+if "upload_msg" not in st.session_state:
+    st.session_state.upload_msg = ""
+if "selected_sheet_idx" not in st.session_state:
+    st.session_state.selected_sheet_idx = 0  # Excel multi-sheet selector
+if "db_analysis_result" not in st.session_state:
+    st.session_state.db_analysis_result = None  # DB ER result
+if "job_id" not in st.session_state:
+    st.session_state.job_id = None  # Active polling job ID
+if "processing_start_time" not in st.session_state:
+    st.session_state.processing_start_time = None  # Polling start timestamp
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def get_pending_files() -> list[Path]:
@@ -189,7 +205,8 @@ def queue_stats() -> dict:
 def find_source_image(job_id: str) -> Path | None:
     exts = {".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".webp"}
     for d in [UPLOAD_DIR, LEGO2_TEMP]:
-        if not d.is_dir(): continue
+        if not d.is_dir():
+            continue
         for f in sorted(d.iterdir()):
             if f.name.startswith(job_id) and f.suffix.lower() in exts:
                 return f
@@ -272,7 +289,7 @@ def generate_summary(extracted_text: str, doc_type: str, api_key: str) -> str:
         client = get_hitl_llm_client(api_key)
         if not client:
             return "❌ No LLM client available. Check QWEN_API_KEY / GROQ_API_KEY or LOCAL_MODEL_URL."
-        model  = os.environ.get("QWEN_MODEL") or os.environ.get("GROQ_MODEL", "qwen/qwen3.6-27b")
+        model  = os.environ.get("QWEN_MODEL") or os.environ.get("GROQ_MODEL", "qwen/qwen3.8-27b")
         # Truncate very large documents to stay within token limits
         text_snippet = extracted_text[:12000]
         prompt = (
@@ -321,7 +338,8 @@ def build_export_frames(ast_data: dict) -> dict[str, pd.DataFrame]:
                     frames[key + "__headers"] = headers   # store headers separately
     result = {}
     for k, v in frames.items():
-        if k.endswith("__headers"): continue
+        if k.endswith("__headers"):
+            continue
         hdrs = frames.get(k + "__headers")
         try:
             result[k[:31]] = pd.DataFrame(v, columns=hdrs) if hdrs else pd.DataFrame(v)
@@ -329,58 +347,232 @@ def build_export_frames(ast_data: dict) -> dict[str, pd.DataFrame]:
             result[k[:31]] = pd.DataFrame(v)
     return result
 
-def upload_file(uploaded_file):
-    if uploaded_file is None:
-        return
-    import requests as rq
-    import time
+# ── Audit Trail & Decision Helpers ───────────────────────────────────────────
+def log_audit(job_id: str, action: str, reviewed_by: str = "operator", previous_state: str = "pending_review", reason: str = ""):
+    entry = {
+        "job_id": job_id,
+        "action": action,
+        "reviewed_by": reviewed_by,
+        "reviewed_at": datetime.now(timezone.utc).isoformat(),
+        "previous_state": previous_state,
+        "reason": reason,
+    }
+    Path(AUDIT_LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
+    with open(AUDIT_LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def approve_document(file_path: str, edited_json: str, reviewer: str = "operator") -> tuple[str, dict]:
+    """Approves a document, captures active learning corrections, and commits to final_database."""
+    if not file_path or not os.path.exists(file_path):
+        return "No document loaded — nothing to approve.", queue_stats()
     try:
-        resp = rq.post(
+        final = json.loads(edited_json)
+    except json.JSONDecodeError as e:
+        return f"Invalid JSON — fix the error before approving:\n`{e}`", queue_stats()
+
+    job_id = Path(file_path).stem
+
+    # Active Learning Correction Capture
+    try:
+        with open(file_path, "r", encoding="utf-8") as orig_f:
+            orig_data = json.load(orig_f)
+        if orig_data != final:
+            final["_original_extraction"] = orig_data
+            corr_entry = {
+                "job_id": job_id,
+                "corrected_at": datetime.now(timezone.utc).isoformat(),
+                "original": orig_data,
+                "final": final,
+            }
+            Path(CORRECTIONS_FILE).parent.mkdir(parents=True, exist_ok=True)
+            with open(CORRECTIONS_FILE, "a", encoding="utf-8") as cf:
+                cf.write(json.dumps(corr_entry) + "\n")
+    except Exception:
+        pass
+
+    final["_approved_at"] = datetime.now(timezone.utc).isoformat() + "Z"
+    final["_reviewed_by"] = reviewer
+
+    dest = Path(FINAL_DIR) / Path(file_path).name
+    Path(dest).parent.mkdir(parents=True, exist_ok=True)
+    with open(dest, "w", encoding="utf-8") as f:
+        json.dump(final, f, indent=4, ensure_ascii=False)
+    try:
+        os.remove(file_path)
+    except Exception:
+        pass
+
+    log_audit(job_id=job_id, action="approved", reviewed_by=reviewer, reason="operator_approval")
+    return "✅ Committed! Record saved to final_database/.", queue_stats()
+
+
+def reject_document(file_path: str, reason: str, reviewer: str = "operator") -> tuple[str, dict]:
+    """Rejects a document, records audit trail, and moves to rejected/."""
+    if not file_path or not os.path.exists(file_path):
+        return "No document loaded.", queue_stats()
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+
+    job_id = Path(file_path).stem
+    data["_rejected_at"] = datetime.now(timezone.utc).isoformat() + "Z"
+    data["_rejection_reason"] = reason or "No reason provided"
+    data["_reviewed_by"] = reviewer
+
+    dest = Path(REJECTED_DIR) / Path(file_path).name
+    Path(dest).parent.mkdir(parents=True, exist_ok=True)
+    with open(dest, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
+    try:
+        os.remove(file_path)
+    except Exception:
+        pass
+
+    log_audit(job_id=job_id, action="rejected", reviewed_by=reviewer, reason=reason or "No reason provided")
+    return "🗑 Rejected. Moved to rejected/.", queue_stats()
+
+
+# ── Ingestion & Polling Logic ────────────────────────────────────────────────
+def upload_file(uploaded_file):
+    """Submits file to FastAPI gateway and initialises session state tracking."""
+    if uploaded_file is None:
+        st.session_state.upload_msg = "⚠️ Please choose a file before submitting."
+        return
+    try:
+        resp = requests.post(
             f"{GATEWAY_URL}/api/v1/ingest",
             files={"file": (uploaded_file.name, uploaded_file.getvalue())},
-            timeout=30,
+            timeout=15.0,
             proxies={"http": None, "https": None},
         )
-        resp.raise_for_status()
-        job_id = resp.json().get("job_id", "?")
-        
-        with st.spinner(f"Processing job {job_id}... Please wait for extraction to complete."):
-            # Active polling loop with 300-second timeout fail-safe for slow CPU OCR
-            max_retries = 300
-            poll_interval = 1
-            expected_file = None
-            
-            for _ in range(max_retries):
-                # Search for the JSON file in pending_review
-                for f in PENDING_DIR.glob("*.json"):
-                    if f.name.startswith(job_id):
-                        expected_file = f
-                        break
-                        
-                if expected_file:
-                    break
-                    
-                time.sleep(poll_interval)
-                
-            if not expected_file:
-                st.error("Backend timeout or crash. The local CPU engine failed to process the document. Please check the backend terminal for Python errors.")
-                return
-                
-        if expected_file:
-            data = load_ast(expected_file)
-            if data:
-                st.session_state.current_file     = expected_file
-                st.session_state.ast_data         = data
-                st.session_state.is_modified      = False
-                st.session_state.current_page_idx = 0
-                st.session_state.upload_msg = f"✅ Successfully processed job `{job_id}`."
-            else:
-                st.session_state.upload_msg = f"❌ Failed to parse AST for job `{job_id}`."
-        else:
-            st.session_state.upload_msg = f"⏳ Timeout waiting for job `{job_id}`. Check the queue manually later."
-            
+        if resp.status_code not in (200, 201, 202):
+            st.session_state.upload_msg = f"❌ Upload failed (HTTP {resp.status_code}): {resp.text}"
+            return
+
+        job_id = resp.json().get("job_id", "")
+        if not job_id:
+            st.session_state.upload_msg = "❌ Upload failed: no job_id returned by gateway."
+            return
+
+        # Track active job in session state
+        st.session_state.job_id = job_id
+        st.session_state.processing_start_time = time.time()
+        st.session_state.upload_msg = f"🚀 Submitted job `{job_id}`. Polling status..."
     except Exception as e:
         st.session_state.upload_msg = f"❌ Upload failed: {e}"
+
+
+def poll_job_status():
+    """
+    Actively polls the FastAPI backend status endpoint for the active job.
+    Enforces a 120s hard timeout, 5.0s request timeout, API error handling,
+    a Cancel button, and breaks upon completion to refresh the queue.
+    """
+    if not st.session_state.get("job_id"):
+        return
+
+    job_id = st.session_state.job_id
+    start_time = st.session_state.get("processing_start_time") or time.time()
+
+    st.markdown("---")
+    st.markdown("**⏳ Active Processing**")
+
+    # Requirement 5: Add a "Cancel Processing" button in the UI
+    if st.button("🛑 Cancel Processing", use_container_width=True, type="secondary", key="btn_cancel_processing"):
+        st.session_state.job_id = None
+        st.session_state.processing_start_time = None
+        st.session_state.upload_msg = "🛑 Processing cancelled by user."
+        st.rerun()
+        return
+
+    status_placeholder = st.empty()
+    status_url = f"{GATEWAY_URL}/api/v1/status/{job_id}"
+
+    while True:
+        # Requirement 2: Add a hard timeout of 120 seconds
+        elapsed = time.time() - start_time
+        if elapsed > 120.0:
+            st.error("Processing timed out. Check backend logs.")
+            st.session_state.upload_msg = f"⏱ Job `{job_id}` timed out after 120s."
+            st.session_state.job_id = None
+            st.session_state.processing_start_time = None
+            break
+
+        status_placeholder.info(f"Processing `{job_id}`... ({elapsed:.1f}s / 120s)")
+
+        # Requirement 3 & 4: Add timeout=5.0 and handle API errors gracefully
+        try:
+            resp = requests.get(status_url, timeout=5.0, proxies={"http": None, "https": None})
+            if resp.status_code != 200:
+                st.warning(f"Backend status endpoint returned HTTP {resp.status_code}: {resp.text}")
+                st.session_state.job_id = None
+                st.session_state.processing_start_time = None
+                break
+            data = resp.json()
+        except Exception as exc:
+            st.warning(f"Failed to reach backend status endpoint: {exc}")
+            st.session_state.job_id = None
+            st.session_state.processing_start_time = None
+            break
+
+        current_status = str(data.get("status", "")).lower()
+
+        # Requirement 6: Ensure that when the status returns "pending_review", "failed", or "rejected",
+        # the loop breaks and the UI refreshes to show the newly completed document in the queue.
+        if current_status == "pending_review":
+            st.session_state.job_id = None
+            st.session_state.processing_start_time = None
+            expected_file = None
+            for f in PENDING_DIR.glob("*.json"):
+                if f.name.startswith(job_id):
+                    expected_file = f
+                    break
+            if expected_file:
+                st.session_state.current_file = expected_file
+                st.session_state.ast_data = load_ast(expected_file)
+                st.session_state.current_page_idx = 0
+            st.session_state.upload_msg = f"✅ Document `{job_id}` completed and queued for review."
+            time.sleep(0.5)
+            st.rerun()
+            break
+
+        elif current_status in ("failed", "rejected"):
+            err_msg = data.get("error") or data.get("reason") or "Document processing rejected or failed."
+            st.session_state.upload_msg = f"❌ Job `{job_id}` {current_status}: {err_msg}"
+            st.session_state.job_id = None
+            st.session_state.processing_start_time = None
+            time.sleep(1.0)
+            st.rerun()
+            break
+
+        elif current_status in ("committed", "completed"):
+            st.session_state.job_id = None
+            st.session_state.processing_start_time = None
+            st.session_state.upload_msg = f"✅ Job `{job_id}` fast-tracked and committed."
+            time.sleep(0.5)
+            st.rerun()
+            break
+
+        # Check disk fallback if file is already written
+        disk_found = False
+        for f in PENDING_DIR.glob("*.json"):
+            if f.name.startswith(job_id):
+                st.session_state.current_file = f
+                st.session_state.ast_data = load_ast(f)
+                st.session_state.current_page_idx = 0
+                st.session_state.upload_msg = f"✅ Document `{job_id}` ready for review."
+                st.session_state.job_id = None
+                st.session_state.processing_start_time = None
+                disk_found = True
+                st.rerun()
+                break
+        if disk_found:
+            break
+
+        time.sleep(1.5)
 
 # ── Auto-load first pending file if none loaded ──────────────────────────────
 pending_files = get_pending_files()
@@ -442,6 +634,9 @@ with st.sidebar:
     if st.session_state.upload_msg:
         st.markdown(st.session_state.upload_msg)
 
+    if st.session_state.get("job_id"):
+        poll_job_status()
+
     st.markdown("---")
     if st.session_state.current_file:
         if st.button("🗑️ Delete Active Document", use_container_width=True):
@@ -497,8 +692,10 @@ with st.sidebar:
                     st.error(f"Schema analysis failed: {exc}")
                 finally:
                     import os as _os
-                    try: _os.unlink(tmp_path)
-                    except Exception: pass
+                    try:
+                        _os.unlink(tmp_path)
+                    except Exception:
+                        pass
 
         if st.session_state.db_analysis_result is not None:
             if st.button("❌ Clear Analysis", key="db_clear"):
@@ -672,7 +869,7 @@ def render_qa_tab(job_id: str, pages: list[dict]):
             with st.spinner("🤖 Qwen 3.6 27B thinking..."):
                 try:
                     client_qa = get_hitl_llm_client(llm_key)
-                    model_name = os.environ.get("QWEN_MODEL") or os.environ.get("GROQ_MODEL", "qwen/qwen3.6-27b")
+                    model_name = os.environ.get("QWEN_MODEL") or os.environ.get("GROQ_MODEL", "qwen/qwen3.8-27b")
                     response = client_qa.chat.completions.create(
                         messages=api_messages,
                         model=model_name,
@@ -785,8 +982,8 @@ if st.session_state.ast_data is None:
 
 
 # ── Document loaded ───────────────────────────────────────────────────────────
-ast       = st.session_state.ast_data
-pages     = ast.get("pages", [])
+ast       = st.session_state.ast_data or {}
+pages     = ast.get("pages", []) or [{}]
 meta      = ast.get("document_metadata", {})
 job_id    = meta.get("doc_id") or ast.get("_job_id", "—")
 filename  = meta.get("source_filename") or ast.get("_filename", "—")
@@ -947,9 +1144,9 @@ with col_left:
     if path_label == "TRACK_A":
         st.success(f"⚡ Vector-Native PDF — {n_pages} pages processed natively.")
     elif path_label == "PATH_1":
-        st.success(f"🔠 Local CPU OCR accepted.")
+        st.success("🔠 Local CPU OCR accepted.")
     else:
-        st.error(f"🧠 Escalated to VLM.")
+        st.error("🧠 Escalated to VLM.")
 
     import logging
     
@@ -1351,31 +1548,50 @@ st.markdown("### 🔍 Validation Decision")
 a_col, r_col = st.columns([2, 1])
 with a_col:
     if st.button("✅ Approve & Commit to Database", type="primary", use_container_width=True):
-        save_to_dir(
-            st.session_state.ast_data, FINAL_DIR,
-            extra_fields={
-                "_approved_at" : datetime.now(timezone.utc).isoformat(),
-                "_reviewed_by" : "human_operator",
-            },
-        )
-        st.session_state.ast_data   = None
-        st.session_state.is_modified = False
-        st.session_state.current_file = None
-        st.success("🎉 Committed to `final_database/`!")
-        st.rerun()
+        if st.session_state.current_file:
+            if st.session_state.is_modified and st.session_state.ast_data:
+                with open(st.session_state.current_file, "w", encoding="utf-8") as f:
+                    json.dump(st.session_state.ast_data, f, indent=4, ensure_ascii=False)
+            msg, _ = approve_document(str(st.session_state.current_file), reviewer="human_operator")
+            st.session_state.ast_data = None
+            st.session_state.is_modified = False
+            st.session_state.current_file = None
+            st.success(f"🎉 {msg}")
+            st.rerun()
+        else:
+            save_to_dir(
+                st.session_state.ast_data, FINAL_DIR,
+                extra_fields={
+                    "_approved_at" : datetime.now(timezone.utc).isoformat(),
+                    "_reviewed_by" : "human_operator",
+                },
+            )
+            st.session_state.ast_data   = None
+            st.session_state.is_modified = False
+            st.session_state.current_file = None
+            st.success("🎉 Committed to `final_database/`!")
+            st.rerun()
 
 with r_col:
     reason = st.text_input("Rejection reason", placeholder="e.g. Wrong document type...")
     if st.button("❌ Reject Document", type="secondary", use_container_width=True):
-        save_to_dir(
-            st.session_state.ast_data, REJECTED_DIR,
-            extra_fields={
-                "_rejected_at"       : datetime.now(timezone.utc).isoformat(),
-                "_rejection_reason"  : reason or "No reason provided",
-            },
-        )
-        st.session_state.ast_data    = None
-        st.session_state.is_modified = False
-        st.session_state.current_file = None
-        st.warning("Document moved to `rejected/`.")
-        st.rerun()
+        if st.session_state.current_file:
+            msg, _ = reject_document(str(st.session_state.current_file), reason=reason, reviewer="human_operator")
+            st.session_state.ast_data    = None
+            st.session_state.is_modified = False
+            st.session_state.current_file = None
+            st.warning(f"🗑 {msg}")
+            st.rerun()
+        else:
+            save_to_dir(
+                st.session_state.ast_data, REJECTED_DIR,
+                extra_fields={
+                    "_rejected_at"       : datetime.now(timezone.utc).isoformat(),
+                    "_rejection_reason"  : reason or "No reason provided",
+                },
+            )
+            st.session_state.ast_data    = None
+            st.session_state.is_modified = False
+            st.session_state.current_file = None
+            st.warning("Document moved to `rejected/`.")
+            st.rerun()

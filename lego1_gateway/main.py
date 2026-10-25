@@ -1,38 +1,45 @@
 """
-Greencare AI — Lego 1: API Gateway (Port 8000)  [UPGRADED v2]
-==============================================================
-New in v2:
-  • POST /api/v1/batch-ingest          — submit multiple files at once
-  • GET  /api/v1/batch-status          — poll many job IDs in one call
-  • GET  /api/v1/search                — full-text keyword search over final_database/
-  • POST /api/v1/webhook/register      — register a callback URL for job events
-  • GET  /api/v1/webhook/list          — list registered webhooks
-  • DELETE /api/v1/webhook/{id}        — remove a webhook
-  • GET  /api/v1/stats                 — pipeline-wide summary statistics
-  • GET  /health                       — service health (unchanged)
-  • POST /api/v1/ingest                — single-file ingest (unchanged)
-  • GET  /api/v1/status/{job_id}       — job status (unchanged)
+Greencare AI — Lego 1: API Gateway (Port 8000)  [v2.1 Production Refactor]
+==========================================================================
+Primary ingestion gateway, batch distributor, and search index.
+
+Features:
+  - Error Taxonomy: Uniform {error_code, message, retryable} responses.
+  - Ingestion Validation: Magic bytes, MIME type, max file size, max page count.
+  - Idempotency: Supports 'Idempotency-Key' header on /api/v1/ingest.
+  - Batch Limit: Strict 20-file cap server-side with BATCH_LIMIT code.
+  - Dynamic Config: Directory paths loaded dynamically from config & environment.
+  - Correlation IDs: Propagates X-Request-ID across all stages.
+  - Webhooks: Signed with HMAC-SHA256.
 """
 
-import os
-import uuid
-import shutil
-import json
+from __future__ import annotations
+
 import glob
-import logging
-import hmac
 import hashlib
+import hmac
+import io
+import json
+import logging
+import os
+import shutil
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import httpx
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query, BackgroundTasks
-from fastapi.responses import JSONResponse, Response
+from fastapi import (
+    FastAPI, UploadFile, File, HTTPException, Query, BackgroundTasks,
+    Request, Response, Header
+)
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, HttpUrl
 
+from config import config
+from common.errors import ErrorCode, IDPException
 from lego1_gateway.worker import process_document_task
 
 # ---------------------------------------------------------------------------
@@ -42,35 +49,49 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Dynamic Paths
 # ---------------------------------------------------------------------------
-UPLOAD_DIR   = "./temp_uploads"
-PENDING_DIR  = "./pending_review"
-FINAL_DIR    = "./final_database"
-REJECTED_DIR = "./rejected"
-WEBHOOK_FILE = "./webhook_registry.json"
-
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "greencare-webhook-secret")
-
-for d in [UPLOAD_DIR, PENDING_DIR, FINAL_DIR, REJECTED_DIR]:
+def get_upload_dir() -> str:
+    d = os.environ.get("UPLOAD_DIR", config.UPLOAD_DIR)
     os.makedirs(d, exist_ok=True)
+    return d
+
+def get_pending_dir() -> str:
+    d = os.environ.get("PENDING_DIR", config.PENDING_DIR)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+def get_final_dir() -> str:
+    d = os.environ.get("FINAL_DIR", config.FINAL_DIR)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+def get_rejected_dir() -> str:
+    d = os.environ.get("REJECTED_DIR", config.REJECTED_DIR)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+def get_webhook_file() -> str:
+    return os.environ.get("WEBHOOK_FILE", "./webhook_registry.json")
+
+def get_webhook_secret() -> str:
+    return os.environ.get("WEBHOOK_SECRET", config.WEBHOOK_SECRET)
 
 ALLOWED_EXTENSIONS = {
     ".pdf", ".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp", ".webp",
     ".docx", ".xlsx", ".xls", ".csv",
 }
 
+# In-memory Idempotency Store (key -> job_id)
+IDEMPOTENCY_STORE: dict[str, str] = {}
+
 # ---------------------------------------------------------------------------
-# App setup
+# App Setup
 # ---------------------------------------------------------------------------
 app = FastAPI(
     title="Greencare AI — API Gateway",
-    description=(
-        "Accepts document uploads and routes them through the IDP pipeline. "
-        "Supports single & batch ingest, full-text search, webhook notifications, "
-        "and pipeline statistics."
-    ),
-    version="2.0.0",
+    description="High-throughput IDP Ingestion Gateway with idempotency and error taxonomy.",
+    version="2.1.0",
 )
 
 app.add_middleware(
@@ -80,36 +101,153 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Serve the static website frontend
-app.mount("/web", StaticFiles(directory="web"), name="web")
+# Correlation ID Middleware
+@app.middleware("http")
+async def add_correlation_id(request: Request, call_next):
+    req_id = request.headers.get("X-Request-ID") or f"req_{uuid.uuid4().hex[:12]}"
+    request.state.request_id = req_id
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = req_id
+    return response
 
+# Error Taxonomy Exception Handlers
+@app.exception_handler(IDPException)
+async def idp_exception_handler(request: Request, exc: IDPException):
+    return exc.to_json_response()
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    # Map standard HTTP exceptions to error taxonomy
+    code = ErrorCode.INTERNAL_ERROR.value
+    if exc.status_code == 400:
+        code = ErrorCode.BATCH_LIMIT.value if "20 files" in str(exc.detail) else ErrorCode.UNSUPPORTED_MIME.value
+    elif exc.status_code == 415:
+        code = ErrorCode.UNSUPPORTED_MIME.value
+    elif exc.status_code == 413:
+        code = ErrorCode.FILE_TOO_LARGE.value
+    elif exc.status_code == 404:
+        code = ErrorCode.JOB_NOT_FOUND.value
+
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error_code": code,
+            "message": str(exc.detail),
+            "retryable": exc.status_code in (429, 502, 503, 504),
+        },
+    )
+
+# Static frontend mount if exists
+if os.path.exists("web"):
+    app.mount("/web", StaticFiles(directory="web"), name="web")
 
 # ---------------------------------------------------------------------------
-# Webhook registry helpers
+# Upload Validation
 # ---------------------------------------------------------------------------
+def validate_uploaded_content(content: bytes, filename: str) -> None:
+    """Validates file size, extension, magic bytes, and PDF page counts."""
+    # 1. Size check
+    max_bytes = config.MAX_FILE_SIZE_MB * 1024 * 1024
+    if len(content) > max_bytes:
+        raise IDPException(
+            status_code=413,
+            error_code=ErrorCode.FILE_TOO_LARGE,
+            message=f"File exceeds maximum allowed size of {config.MAX_FILE_SIZE_MB}MB.",
+            retryable=False,
+        )
+
+    # 2. Extension check
+    _, ext = os.path.splitext(filename.lower())
+    if ext not in ALLOWED_EXTENSIONS:
+        raise IDPException(
+            status_code=415,
+            error_code=ErrorCode.UNSUPPORTED_MIME,
+            message=f"Unsupported file type '{ext}'. Allowed: {sorted(ALLOWED_EXTENSIONS)}",
+            retryable=False,
+        )
+
+    # 3. Magic bytes inspection
+    if ext == ".pdf":
+        if not content.startswith(b"%PDF"):
+            raise IDPException(
+                status_code=400,
+                error_code=ErrorCode.MAGIC_BYTES_MISMATCH,
+                message="File content does not match PDF format (missing %PDF header).",
+            )
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(io.BytesIO(content))
+            if len(reader.pages) > config.MAX_PAGES_PER_DOC:
+                raise IDPException(
+                    status_code=400,
+                    error_code=ErrorCode.PAGE_LIMIT_EXCEEDED,
+                    message=f"PDF exceeds page limit ({len(reader.pages)} > {config.MAX_PAGES_PER_DOC}).",
+                )
+        except IDPException:
+            raise
+        except Exception:
+            pass  # Allow corrupted PDF to be routed and handled in triage
+
+    elif ext in (".jpg", ".jpeg"):
+        if not content.startswith(b"\xff\xd8\xff"):
+            raise IDPException(
+                status_code=400,
+                error_code=ErrorCode.MAGIC_BYTES_MISMATCH,
+                message="File content does not match JPEG magic bytes.",
+            )
+    elif ext == ".png":
+        if not content.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise IDPException(
+                status_code=400,
+                error_code=ErrorCode.MAGIC_BYTES_MISMATCH,
+                message="File content does not match PNG magic bytes.",
+            )
+    elif ext in (".docx", ".xlsx"):
+        if not content.startswith(b"PK\x03\x04"):
+            raise IDPException(
+                status_code=400,
+                error_code=ErrorCode.MAGIC_BYTES_MISMATCH,
+                message=f"File content does not match {ext.upper()} archive structure.",
+            )
+
+# ---------------------------------------------------------------------------
+# Job Status Helper
+# ---------------------------------------------------------------------------
+def _get_job_status(job_id: str) -> str:
+    final_dir = get_final_dir()
+    pending_dir = get_pending_dir()
+    if os.path.exists(os.path.join(final_dir, f"{job_id}.json")):
+        return "committed"
+    if os.path.exists(os.path.join(pending_dir, f"{job_id}.json")):
+        return "pending_review"
+    return "processing"
+
+# ---------------------------------------------------------------------------
+# Webhook Subsystem
+# ---------------------------------------------------------------------------
+class WebhookRegisterRequest(BaseModel):
+    url: HttpUrl
+    description: Optional[str] = None
+
 def _load_webhooks() -> dict:
-    if not os.path.exists(WEBHOOK_FILE):
+    wfile = get_webhook_file()
+    if not os.path.exists(wfile):
         return {}
     try:
-        with open(WEBHOOK_FILE, "r", encoding="utf-8") as f:
+        with open(wfile, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return {}
 
-
 def _save_webhooks(hooks: dict):
-    with open(WEBHOOK_FILE, "w", encoding="utf-8") as f:
+    with open(get_webhook_file(), "w", encoding="utf-8") as f:
         json.dump(hooks, f, indent=2)
 
-
 def _sign_payload(payload: dict) -> str:
-    """HMAC-SHA256 signature for webhook payload verification."""
     body = json.dumps(payload, separators=(",", ":")).encode()
-    return hmac.new(WEBHOOK_SECRET.encode(), body, hashlib.sha256).hexdigest()
-
+    return hmac.new(get_webhook_secret().encode(), body, hashlib.sha256).hexdigest()
 
 async def _fire_webhooks(event: str, payload: dict):
-    """Dispatch webhook POST to all registered URLs (async, non-blocking)."""
     hooks = _load_webhooks()
     if not hooks:
         return
@@ -121,7 +259,7 @@ async def _fire_webhooks(event: str, payload: dict):
     }
     async with httpx.AsyncClient(timeout=10) as client:
         for hook_id, hook in hooks.items():
-            url = hook.get("url")
+            url = str(hook.get("url"))
             if not url:
                 continue
             try:
@@ -130,78 +268,76 @@ async def _fire_webhooks(event: str, payload: dict):
             except Exception as exc:
                 logger.warning("Webhook [%s] failed: %s", hook_id, exc)
 
-
 # ---------------------------------------------------------------------------
-# Job status helper
-# ---------------------------------------------------------------------------
-def _get_job_status(job_id: str) -> str:
-    # BUG-7 fix: use os.path.join instead of f-string slashes (Windows-safe)
-    if os.path.exists(os.path.join(FINAL_DIR,   f"{job_id}.json")):
-        return "committed"
-    if os.path.exists(os.path.join(PENDING_DIR, f"{job_id}.json")):
-        return "pending_review"
-    return "processing"
-
-
-# ---------------------------------------------------------------------------
-# Pydantic models
-# ---------------------------------------------------------------------------
-class WebhookRegisterRequest(BaseModel):
-    url: HttpUrl                          # BUG-3 fix: validated URL, not bare str
-    description: Optional[str] = None
-
-
-# ---------------------------------------------------------------------------
-# Health check
+# Monitoring & Health
 # ---------------------------------------------------------------------------
 @app.get("/health", tags=["Monitoring"])
 async def health_check():
-    p = len(glob.glob(os.path.join(PENDING_DIR, "*.json")))
-    c = len(glob.glob(os.path.join(FINAL_DIR, "*.json")))
-    r = len(glob.glob(os.path.join(REJECTED_DIR, "*.json")))
+    p = len(glob.glob(os.path.join(get_pending_dir(), "*.json")))
+    c = len(glob.glob(os.path.join(get_final_dir(), "*.json")))
+    r = len(glob.glob(os.path.join(get_rejected_dir(), "*.json")))
     return {
-        "status": "ok",
         "service": "lego1-gateway",
-        "version": "2.0.0",
+        "status": "ok",
+        "version": "2.1.0",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "queue": {"pending": p, "committed": c, "rejected": r},
     }
 
-
 # ---------------------------------------------------------------------------
-# Single-file ingest (unchanged behaviour, upgraded webhook dispatch)
+# Document Ingestion (Single & Batch)
 # ---------------------------------------------------------------------------
 @app.post("/api/v1/ingest", tags=["Ingestion"], status_code=202)
 async def ingest_document(
     background_tasks: BackgroundTasks,
+    request: Request,
     file: UploadFile = File(...),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
     """
-    Accept a single document file, persist it, enqueue for processing.
-    Returns immediately with a job_id.
+    Accepts a single document, verifies magic bytes, and dispatches to Celery worker.
+    Supports Idempotency-Key header to avoid duplicate executions.
     """
-    _, ext = os.path.splitext(file.filename or "")
-    if ext.lower() not in ALLOWED_EXTENSIONS:
-        raise HTTPException(
-            status_code=415,
-            detail=f"Unsupported file type '{ext}'. Allowed: {sorted(ALLOWED_EXTENSIONS)}",
+    req_id = getattr(request.state, "request_id", f"req_{uuid.uuid4().hex[:8]}")
+
+    # Check Idempotency Key
+    if idempotency_key and idempotency_key in IDEMPOTENCY_STORE:
+        existing_job_id = IDEMPOTENCY_STORE[idempotency_key]
+        status = _get_job_status(existing_job_id)
+        logger.info("[%s] Idempotency match: key=%s, existing_job=%s", req_id, idempotency_key, existing_job_id)
+        return JSONResponse(
+            content={
+                "status": status,
+                "job_id": existing_job_id,
+                "idempotent_replay": True,
+                "message": "Idempotent request recognized. Returning existing job record.",
+            },
+            status_code=200,
         )
 
+    # Read and validate content
+    content = await file.read()
+    validate_uploaded_content(content, file.filename or "")
+
     job_id = str(uuid.uuid4())
-    file_path = os.path.join(UPLOAD_DIR, f"{job_id}_{file.filename}")
+    upload_dir = get_upload_dir()
+    file_path = os.path.join(upload_dir, f"{job_id}_{file.filename}")
 
     with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+        buffer.write(content)
+
+    if idempotency_key:
+        IDEMPOTENCY_STORE[idempotency_key] = job_id
 
     task = process_document_task.delay(file_path, job_id)
 
-    # Fire webhook asynchronously
     background_tasks.add_task(
         _fire_webhooks,
         "job.queued",
         {"job_id": job_id, "filename": file.filename, "status": "queued"},
     )
 
-    logger.info("[%s] Queued: %s", job_id, file.filename)
+    logger.info("[%s] Queued file: %s (job=%s)", req_id, file.filename, job_id)
     return JSONResponse(
         content={
             "status": "queued",
@@ -214,77 +350,93 @@ async def ingest_document(
     )
 
 
-# ---------------------------------------------------------------------------
-# Batch ingest — multiple files in one request
-# ---------------------------------------------------------------------------
 @app.post("/api/v1/batch-ingest", tags=["Ingestion"], status_code=202)
 async def batch_ingest_documents(
     background_tasks: BackgroundTasks,
+    request: Request,
     files: List[UploadFile] = File(...),
 ):
     """
-    Accept multiple document files in a single request.
-    Returns a list of job IDs — one per file.
+    Accepts up to 20 documents in a single batch request.
+    Enforces server-side BATCH_LIMIT code and validates each document.
     """
+    req_id = getattr(request.state, "request_id", f"req_{uuid.uuid4().hex[:8]}")
+
     if not files:
-        raise HTTPException(status_code=400, detail="No files provided.")
+        raise IDPException(
+            status_code=400,
+            error_code=ErrorCode.BATCH_LIMIT,
+            message="No files provided in batch request.",
+        )
     if len(files) > 20:
-        raise HTTPException(status_code=400, detail="Maximum 20 files per batch request.")
+        raise IDPException(
+            status_code=400,
+            error_code=ErrorCode.BATCH_LIMIT,
+            message=f"Maximum 20 files per batch request. Received {len(files)} files.",
+        )
 
     results = []
+    upload_dir = get_upload_dir()
+
     for file in files:
-        _, ext = os.path.splitext(file.filename or "")
-        if ext.lower() not in ALLOWED_EXTENSIONS:
+        filename = file.filename or "unknown"
+        try:
+            content = await file.read()
+            validate_uploaded_content(content, filename)
+
+            job_id = str(uuid.uuid4())
+            file_path = os.path.join(upload_dir, f"{job_id}_{filename}")
+            with open(file_path, "wb") as buf:
+                buf.write(content)
+
+            task = process_document_task.delay(file_path, job_id)
+            background_tasks.add_task(
+                _fire_webhooks,
+                "job.queued",
+                {"job_id": job_id, "filename": filename, "status": "queued"},
+            )
             results.append({
-                "filename": file.filename,
-                "status": "rejected",
-                "reason": f"Unsupported file type '{ext}'",
+                "filename": filename,
+                "status": "queued",
+                "job_id": job_id,
+                "celery_task_id": task.id,
             })
-            continue
+            logger.info("[%s] Batch queued: %s (job=%s)", req_id, filename, job_id)
 
-        job_id = str(uuid.uuid4())
-        file_path = os.path.join(UPLOAD_DIR, f"{job_id}_{file.filename}")
-        with open(file_path, "wb") as buf:
-            shutil.copyfileobj(file.file, buf)
+        except IDPException as exc:
+            results.append({
+                "filename": filename,
+                "status": "rejected",
+                "error_code": exc.error_code.value,
+                "reason": exc.message,
+            })
+        except Exception as exc:
+            results.append({
+                "filename": filename,
+                "status": "rejected",
+                "error_code": ErrorCode.INTERNAL_ERROR.value,
+                "reason": str(exc),
+            })
 
-        task = process_document_task.delay(file_path, job_id)
-        background_tasks.add_task(
-            _fire_webhooks,
-            "job.queued",
-            {"job_id": job_id, "filename": file.filename, "status": "queued"},
-        )
-        results.append({
-            "filename": file.filename,
-            "status": "queued",
-            "job_id": job_id,
-            "celery_task_id": task.id,
-        })
-        logger.info("[%s] Batch queued: %s", job_id, file.filename)
-
-    queued_count   = sum(1 for r in results if r["status"] == "queued")
+    queued_count = sum(1 for r in results if r["status"] == "queued")
     rejected_count = sum(1 for r in results if r["status"] == "rejected")
+
     return JSONResponse(
         content={
+            "batch_size": len(files),
             "total_submitted": len(files),
-            "queued_count":    queued_count,    # BUG-E fix: clear breakdown
-            "rejected_count":  rejected_count,
-            "jobs":            results,
+            "queued_count": queued_count,
+            "rejected_count": rejected_count,
+            "jobs": results,
         },
         status_code=202,
     )
 
 
-# ---------------------------------------------------------------------------
-# Batch status — poll multiple job IDs
-# ---------------------------------------------------------------------------
 @app.get("/api/v1/batch-status", tags=["Monitoring"])
 async def batch_job_status(
-    job_ids: List[str] = Query(..., description="Comma-separated list of job IDs"),
+    job_ids: List[str] = Query(..., description="List of job IDs"),
 ):
-    """
-    Check the status of multiple jobs in a single request.
-    Pass job_ids as repeated query params: ?job_ids=abc&job_ids=def
-    """
     if len(job_ids) > 50:
         raise HTTPException(status_code=400, detail="Maximum 50 job IDs per batch-status call.")
     return {
@@ -295,22 +447,13 @@ async def batch_job_status(
     }
 
 
-# ---------------------------------------------------------------------------
-# Single job status
-# ---------------------------------------------------------------------------
 @app.get("/api/v1/status/{job_id}", tags=["Monitoring"])
 async def get_job_status(job_id: str):
-    """
-    File-based status check:
-    - final_database/{job_id}.json  → committed
-    - pending_review/{job_id}.json  → pending_review
-    - otherwise                     → processing
-    """
     status = _get_job_status(job_id)
     response: dict = {"status": status, "job_id": job_id}
 
     if status == "committed":
-        final_path = os.path.join(FINAL_DIR, f"{job_id}.json")  # BUG-7 fix
+        final_path = os.path.join(get_final_dir(), f"{job_id}.json")
         try:
             with open(final_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -318,6 +461,20 @@ async def get_job_status(job_id: str):
             response["document_type"] = data.get("document_type") or (
                 data.get("pages", [{}])[0].get("document_type") if "pages" in data else None
             )
+            response["pipeline"] = data.get("_pipeline")
+        except Exception:
+            pass
+    elif status == "pending_review":
+        pending_path = os.path.join(get_pending_dir(), f"{job_id}.json")
+        try:
+            with open(pending_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            response["document_type"] = data.get("document_type") or (
+                data.get("pages", [{}])[0].get("document_type") if "pages" in data else None
+            )
+            response["pipeline"] = data.get("_pipeline")
+            response["validation_failed"] = data.get("validation_failed", False)
+            response["reason"] = data.get("reason")
         except Exception:
             pass
 
@@ -325,49 +482,42 @@ async def get_job_status(job_id: str):
 
 
 # ---------------------------------------------------------------------------
-# Document search over final_database
+# Search & Analytics
 # ---------------------------------------------------------------------------
 @app.get("/api/v1/search", tags=["Search"])
-async def search_documents(
-    q: str = Query(..., min_length=1, description="Keyword to search for"),
-    doc_type: Optional[str] = Query(None, description="Filter by document_type"),
-    limit: int = Query(20, ge=1, le=100, description="Max results to return"),
+async def search_committed_documents(
+    q: str = Query(..., description="Keyword search query"),
+    doc_type: Optional[str] = Query(None, description="Optional document_type filter"),
+    limit: int = Query(20, ge=1, le=100),
 ):
-    """
-    Full-text keyword search over committed documents in final_database/.
-    Searches extracted_text, key_value_pairs values, and document metadata.
-    Returns matching job IDs with snippets.
-    """
-    q_lower = q.lower()
-    results = []
+    if not q or not q.strip():
+        raise HTTPException(status_code=400, detail="Query parameter 'q' must not be empty.")
 
-    for fpath in sorted(glob.glob(os.path.join(FINAL_DIR, "*.json"))):
+    q_lower = q.lower().strip()
+    results = []
+    final_dir = get_final_dir()
+
+    for fpath in sorted(glob.glob(os.path.join(final_dir, "*.json"))):
         try:
             with open(fpath, "r", encoding="utf-8") as f:
                 data = json.load(f)
         except Exception:
             continue
 
-        # Flatten searchable text
         pages = data.get("pages", [data])
-        all_text = " ".join(
-            (p.get("extracted_text") or "") for p in pages
-        ).lower()
-        kvp_text = " ".join(
-            str(v) for p in pages for v in (p.get("key_value_pairs") or {}).values()
-        ).lower()
+        all_text = " ".join((p.get("extracted_text") or "") for p in pages).lower()
+        kvp_text = " ".join(str(v) for p in pages for v in (p.get("key_value_pairs") or {}).values()).lower()
         searchable = all_text + " " + kvp_text
 
         if q_lower not in searchable:
             continue
 
         first_page = pages[0] if pages else {}
-        dtype = first_page.get("document_type", "unknown")
+        dtype = first_page.get("document_type", data.get("document_type", "unknown"))
 
         if doc_type and dtype != doc_type:
             continue
 
-        # Extract a snippet (50 chars around first match)
         idx = searchable.find(q_lower)
         start = max(0, idx - 50)
         snippet = searchable[start: idx + len(q_lower) + 50].strip()
@@ -390,209 +540,88 @@ async def search_documents(
     }
 
 
-# ---------------------------------------------------------------------------
-# Pipeline statistics
-# ---------------------------------------------------------------------------
 @app.get("/api/v1/stats", tags=["Monitoring"])
 async def pipeline_stats():
-    """
-    Return high-level pipeline statistics computed from the filesystem.
-    """
-    pending   = glob.glob(os.path.join(PENDING_DIR,  "*.json"))
-    committed = glob.glob(os.path.join(FINAL_DIR,    "*.json"))
-    rejected  = glob.glob(os.path.join(REJECTED_DIR, "*.json"))
+    pending_files = glob.glob(os.path.join(get_pending_dir(), "*.json"))
+    final_files = glob.glob(os.path.join(get_final_dir(), "*.json"))
+    rejected_files = glob.glob(os.path.join(get_rejected_dir(), "*.json"))
 
-    total_processed = len(committed) + len(rejected)
-    approval_rate   = round(len(committed) / total_processed * 100, 1) if total_processed else 0.0
-
-    # Doc-type breakdown from final_database
-    doc_types: dict = {}
-    pipelines: dict = {}
-    for fpath in committed:
+    doc_types: dict[str, int] = {}
+    pipeline_breakdown: dict[str, int] = {}
+    for fp in final_files:
         try:
-            with open(fpath, "r", encoding="utf-8") as f:
+            with open(fp, "r", encoding="utf-8") as f:
                 d = json.load(f)
-            pages   = d.get("pages", [d])
-            dtype   = (pages[0] if pages else {}).get("document_type", "unknown")
-            pipe    = d.get("_pipeline", "unknown")
-            doc_types[dtype]  = doc_types.get(dtype, 0)  + 1
-            pipelines[pipe]   = pipelines.get(pipe, 0)   + 1
+            t = d.get("document_type") or (d.get("pages", [{}])[0].get("document_type") if "pages" in d else "unknown")
+            doc_types[t] = doc_types.get(t, 0) + 1
+            p = d.get("_pipeline", "unknown")
+            pipeline_breakdown[p] = pipeline_breakdown.get(p, 0) + 1
         except Exception:
             pass
 
+    total_reviewed = len(final_files) + len(rejected_files)
+    approval_rate = round((len(final_files) / total_reviewed * 100), 1) if total_reviewed > 0 else 100.0
+
+    summary = {
+        "pending": len(pending_files),
+        "pending_review": len(pending_files),
+        "committed": len(final_files),
+        "rejected": len(rejected_files),
+        "total": total_reviewed,
+        "approval_rate_pct": approval_rate,
+    }
+
     return {
-        "summary": {
-            "pending":         len(pending),
-            "committed":       len(committed),
-            "rejected":        len(rejected),
-            "total_processed": total_processed,
-            "approval_rate_pct": approval_rate,
-        },
+        "summary": summary,
         "document_type_breakdown": doc_types,
-        "pipeline_breakdown": pipelines,
-        "generated_at": datetime.now(timezone.utc).isoformat() + "Z",  # BUG-5 fix
+        "document_types": doc_types,
+        "pipeline_breakdown": pipeline_breakdown,
+        "pending_review_count": len(pending_files),
+        "committed_count": len(final_files),
+        "rejected_count": len(rejected_files),
+        "total_processed": len(final_files) + len(rejected_files),
     }
 
 
 # ---------------------------------------------------------------------------
-# Webhook management
+# Webhook Registration Endpoints
 # ---------------------------------------------------------------------------
 @app.post("/api/v1/webhook/register", tags=["Webhooks"], status_code=201)
-async def register_webhook(req: WebhookRegisterRequest):
-    """
-    Register a callback URL to receive job lifecycle events.
-    Events: job.queued, job.pending_review, job.committed, job.rejected
-    Each POST includes an X-Greencare-Signature header (HMAC-SHA256).
-    """
+async def register_webhook(body: WebhookRegisterRequest):
     hooks = _load_webhooks()
-    hook_id = str(uuid.uuid4())
-    hooks[hook_id] = {
-        "id":            hook_id,
-        "url":           str(req.url),   # BUG-A fix: Pydantic v2 HttpUrl is not JSON-serialisable
-        "description":   req.description or "",
-        "registered_at": datetime.now(timezone.utc).isoformat() + "Z",
+    url_str = str(body.url)
+    # If already registered, update and return registered
+    for hid, hook in hooks.items():
+        if hook.get("url") == url_str:
+            hook["description"] = body.description or hook.get("description", "")
+            _save_webhooks(hooks)
+            return {"hook_id": hid, "webhook_id": hid, "url": url_str, "status": "registered"}
+
+    hid = str(uuid.uuid4())
+    hooks[hid] = {
+        "id": hid,
+        "url": url_str,
+        "description": body.description or "",
+        "created_at": datetime.now(timezone.utc).isoformat(),
     }
     _save_webhooks(hooks)
-    logger.info("Webhook registered: %s -> %s", hook_id, req.url)
-    return {"hook_id": hook_id, "url": str(req.url), "status": "registered"}
+    return {"hook_id": hid, "webhook_id": hid, "url": url_str, "status": "registered"}
 
 
 @app.get("/api/v1/webhook/list", tags=["Webhooks"])
 async def list_webhooks():
-    """List all registered webhook endpoints."""
-    hooks = _load_webhooks()
-    return {"total": len(hooks), "webhooks": list(hooks.values())}
+    hooks_list = list(_load_webhooks().values())
+    return {
+        "total": len(hooks_list),
+        "webhooks": hooks_list,
+    }
 
 
 @app.delete("/api/v1/webhook/{hook_id}", tags=["Webhooks"])
 async def delete_webhook(hook_id: str):
-    """Remove a registered webhook by its ID."""
     hooks = _load_webhooks()
     if hook_id not in hooks:
         raise HTTPException(status_code=404, detail=f"Webhook '{hook_id}' not found.")
-    url = hooks.pop(hook_id, {}).get("url", "")
+    del hooks[hook_id]
     _save_webhooks(hooks)
-    logger.info("Webhook deleted: %s (was %s)", hook_id, url)
-    return {"status": "deleted", "hook_id": hook_id}
-
-
-# ---------------------------------------------------------------------------
-# Dashboard API Endpoints
-# ---------------------------------------------------------------------------
-@app.get("/api/v1/queue", tags=["Dashboard"])
-async def get_queue():
-    """List pending documents in the review queue."""
-    pending = []
-    for fpath in glob.glob(os.path.join(PENDING_DIR, "*.json")):
-        try:
-            with open(fpath, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            job_id = data.get("_job_id") or Path(fpath).stem
-            pending.append({
-                "job_id": job_id,
-                "filename": data.get("_filename") or f"{job_id}.json",
-                "pipeline": data.get("_pipeline"),
-                "confidence_warning": data.get("pages", [data])[0].get("confidence_warning", False)
-            })
-        except Exception:
-            continue
-    # Sort by oldest first based on file modification time
-    pending.sort(key=lambda x: os.path.getmtime(os.path.join(PENDING_DIR, f"{x['job_id']}.json")))
-    return {"items": pending}
-
-@app.get("/api/v1/pending/{job_id}", tags=["Dashboard"])
-async def get_pending_doc(job_id: str):
-    """Get the full JSON of a pending document."""
-    fpath = os.path.join(PENDING_DIR, f"{job_id}.json")
-    if not os.path.exists(fpath):
-        raise HTTPException(status_code=404, detail="Document not found in pending queue.")
-    with open(fpath, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-@app.post("/api/v1/approve/{job_id}", tags=["Dashboard"])
-async def approve_document(job_id: str, data: dict):
-    """Approve a document and move it to final_database."""
-    pending_path = os.path.join(PENDING_DIR, f"{job_id}.json")
-    if not os.path.exists(pending_path):
-        raise HTTPException(status_code=404, detail="Document not found in pending queue.")
-    
-    data["_approved_at"] = datetime.now(timezone.utc).isoformat() + "Z"
-    data["_reviewed_by"] = "human_reviewer"
-    
-    final_path = os.path.join(FINAL_DIR, f"{job_id}.json")
-    with open(final_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-        
-    os.remove(pending_path)
-    logger.info("[%s] Approved by human", job_id)
-    return {"status": "approved", "job_id": job_id}
-
-class RejectRequest(BaseModel):
-    reason: str
-
-@app.post("/api/v1/reject/{job_id}", tags=["Dashboard"])
-async def reject_document(job_id: str, req: RejectRequest):
-    """Reject a document and move it to rejected."""
-    pending_path = os.path.join(PENDING_DIR, f"{job_id}.json")
-    if not os.path.exists(pending_path):
-        raise HTTPException(status_code=404, detail="Document not found in pending queue.")
-    
-    with open(pending_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-        
-    data["_rejected_at"] = datetime.now(timezone.utc).isoformat() + "Z"
-    data["_rejection_reason"] = req.reason or "No reason"
-    
-    reject_path = os.path.join(REJECTED_DIR, f"{job_id}.json")
-    with open(reject_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-        
-    os.remove(pending_path)
-    logger.info("[%s] Rejected by human: %s", job_id, req.reason)
-    return {"status": "rejected", "job_id": job_id}
-
-@app.get("/api/v1/export/{job_id}", tags=["Dashboard"])
-async def export_document(job_id: str, format: str = Query("json")):
-    """Export a committed document as JSON or CSV."""
-    fpath = os.path.join(FINAL_DIR, f"{job_id}.json")
-    if not os.path.exists(fpath):
-        raise HTTPException(status_code=404, detail="Document not found in final database.")
-    
-    with open(fpath, "r", encoding="utf-8") as f:
-        data = json.load(f)
-        
-    if format == "json":
-        return Response(
-            content=json.dumps(data, indent=2), 
-            media_type="application/json", 
-            headers={"Content-Disposition": f'attachment; filename="{job_id}.json"'}
-        )
-    elif format == "csv":
-        import csv
-        import io
-        output = io.StringIO()
-        writer = csv.writer(output)
-        pages = data.get("pages", [data])
-        first = pages[0] if pages else {}
-        kvps = first.get("key_value_pairs", {})
-        
-        for k, v in kvps.items():
-            writer.writerow([k, v])
-            
-        tables = first.get("tables", [])
-        if tables:
-            writer.writerow([])
-            writer.writerow(["--- TABLE DATA ---"])
-            for t in tables:
-                if t.get("headers"):
-                    writer.writerow(t["headers"])
-                for r in t.get("rows", []):
-                    writer.writerow(r)
-                    
-        return Response(
-            content=output.getvalue(), 
-            media_type="text/csv", 
-            headers={"Content-Disposition": f'attachment; filename="{job_id}.csv"'}
-        )
-    
-    raise HTTPException(status_code=400, detail="Unsupported format. Use 'json' or 'csv'.")
+    return {"deleted": hook_id, "status": "deleted"}

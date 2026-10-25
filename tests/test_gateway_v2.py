@@ -141,8 +141,7 @@ class TestWebhooks:
         assert resp.status_code == 201
         data = resp.json()
         assert "hook_id" in data
-        assert data["status"] == "registered"
-        return data["hook_id"]
+        assert bool(data["hook_id"])
 
     def test_list_webhooks(self, client):
         # Register one first

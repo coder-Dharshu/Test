@@ -55,17 +55,23 @@ def client(tmp_dirs, monkeypatch_session):
     from fastapi.testclient import TestClient
     # Import a lightweight version — skip Celery by mocking
     import unittest.mock as mock
-    with mock.patch("worker.process_document_task") as mock_task:
+    with mock.patch("lego1_gateway.main.process_document_task") as mock_task:
         mock_task.delay.return_value = mock.MagicMock(id="test-celery-id")
         from lego1_gateway.main import app
         yield TestClient(app)
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="session", autouse=True)
 def monkeypatch_session(request):
     """Session-scoped monkeypatch."""
     from _pytest.monkeypatch import MonkeyPatch
     mp = MonkeyPatch()
+    mp.setenv("GROQ_API_KEY", "gsk_test_mock_api_key_12345678")
+    try:
+        from config import config
+        config.GROQ_API_KEY = "gsk_test_mock_api_key_12345678"
+    except Exception:
+        pass
     yield mp
     mp.undo()
 

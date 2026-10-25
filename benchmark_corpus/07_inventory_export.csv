@@ -1,0 +1,4 @@
+SKU,Item_Name,Warehouse_Location,Stock_Qty,Reorder_Level
+SKU-091,Industrial Optical Sensor,Aisle 4B,120,25
+SKU-092,Embedded Controller Module,Aisle 2A,45,10
+SKU-093,Thermal Heat Sink,Aisle 1D,350,50
