@@ -1,6 +1,6 @@
 """
-Greencare AI — Lego 1: API Gateway (Port 8000)  [v2.1 Production Refactor]
-==========================================================================
+IDP — Lego 1: API Gateway (Port 8000)  [v2.1 Production Refactor]
+================================================================
 Primary ingestion gateway, batch distributor, and search index.
 
 Features:
@@ -89,7 +89,7 @@ IDEMPOTENCY_STORE: dict[str, str] = {}
 # App Setup
 # ---------------------------------------------------------------------------
 app = FastAPI(
-    title="Greencare AI — API Gateway",
+    title="IDP — API Gateway",
     description="High-throughput IDP Ingestion Gateway with idempotency and error taxonomy.",
     version="2.1.0",
 )
@@ -254,8 +254,8 @@ async def _fire_webhooks(event: str, payload: dict):
     sig = _sign_payload(payload)
     headers = {
         "Content-Type": "application/json",
-        "X-Greencare-Event": event,
-        "X-Greencare-Signature": f"sha256={sig}",
+        "X-IDP-Event": event,
+        "X-IDP-Signature": f"sha256={sig}",
     }
     async with httpx.AsyncClient(timeout=10) as client:
         for hook_id, hook in hooks.items():

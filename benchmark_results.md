@@ -1,4 +1,4 @@
-# Greencare AI / Pramaan IDP — Benchmark Results
+# IDP — Benchmark Results
 
 **Date Generated:** 2026-10-22  
 **Corpus Size:** 8 diverse documents (Digital PDF, Scanned Images, Mobile Photos, DOCX, XLSX, CSV, Corrupt)  

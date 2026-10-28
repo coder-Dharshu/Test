@@ -1,6 +1,6 @@
 """
-Greencare AI — Lego 3: Qwen Vision Engine  [v2.1 Production Refactor]
-=====================================================================
+IDP — Lego 3: Qwen Vision Engine  [v2.1 Production Refactor]
+============================================================
 Unified OpenAI-compatible multimodal inference engine.
 Supports:
   - 'groq': High-speed accelerated cloud VLM (Groq API)
@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 # FastAPI App
 # ---------------------------------------------------------------------------
 app = FastAPI(
-    title="Greencare AI — Lego 3: Vision Engine",
+    title="IDP — Lego 3: Vision Engine",
     description="Multimodal VLM engine with unified OpenAI client, retry backoff, and Pydantic validation.",
     version="2.1.0",
 )

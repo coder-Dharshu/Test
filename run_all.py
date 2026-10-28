@@ -1,5 +1,5 @@
 """
-Greencare AI — Master Launcher (No Docker, No Redis Required)
+IDP Platform — Master Launcher (No Docker, No Redis Required)
 =============================================================
 Starts all 4 Lego services in separate background processes:
   Lego 2 → http://localhost:8001  (CPU Triage)
@@ -233,7 +233,7 @@ def shutdown_all():
 # ── Main ───────────────────────────────────────────────────────────────────
 
 def main():
-    print(f"\n{BOLD}[*] Greencare AI -- Starting All Services{RESET}")
+    print(f"\n{BOLD}[*] IDP Platform -- Starting All Services{RESET}")
     print(f"{'=' * 55}")
 
     # Create required directories
@@ -271,7 +271,7 @@ def main():
 
     from config import config as _cfg
     print(f"\n{BOLD}{'=' * 65}{RESET}")
-    print(f"{BOLD}🌿 IDP (Greencare AI / Pramaan) — Cluster Running!{RESET}")
+    print(f"{BOLD}IDP Platform — Cluster Running!{RESET}")
     print(f"  Backend        : {BOLD}{_cfg.INFERENCE_BACKEND.upper()}{RESET}")
     print(f"  Model          : {BOLD}{_cfg.LOCAL_MODEL_NAME if _cfg.INFERENCE_BACKEND == 'local' else _cfg.QWEN_MODEL}{RESET}")
     print(f"  Cloud Allowed  : {BOLD}{_cfg.ALLOW_CLOUD_ESCALATION}{RESET}")

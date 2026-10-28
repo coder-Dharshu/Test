@@ -1,4 +1,4 @@
-# Greencare AI — Python Dependencies
+# IDP Platform — Python Dependencies
 # Install with: pip install -r requirements.txt
 
 # ── Web Framework ──────────────────────────────────────────────────────────

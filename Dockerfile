@@ -1,6 +1,6 @@
 # ============================================================
-# Greencare AI — Unified Dockerfile
-# All four Lego services use the same image; the entrypoint
+# IDP Platform — Unified Dockerfile
+# All five Lego services use the same image; the entrypoint
 # command is specified per-service in docker-compose.yml.
 # ============================================================
 

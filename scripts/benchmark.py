@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Greencare AI / Pramaan IDP — Production Benchmark Script
-========================================================
+IDP — Production Benchmark Script
+=================================
 Measures real routing behavior, throughput, OCR confidence, latency percentiles,
 VLM token usage, and cost across a realistic enterprise document corpus:
 - Digital Vector PDF (Track A)
@@ -60,7 +60,7 @@ def generate_synthetic_corpus(output_dir: Path) -> List[Path]:
     doc1 = fitz.open()
     page1 = doc1.new_page()
     page1.insert_text((50, 72), "TAX INVOICE #INV-2026-9901\n"
-                                "Vendor: Greencare AI Technologies Inc.\n"
+                                "Vendor: IDP Technologies Inc.\n"
                                 "Date: 2026-10-22\n"
                                 "Bill To: Enterprise Partner Corp\n\n"
                                 "Description           Qty   Unit Price    Total\n"
@@ -93,7 +93,7 @@ def generate_synthetic_corpus(output_dir: Path) -> List[Path]:
     p3 = output_dir / "03_clean_scanned_receipt.jpg"
     img_scan = np.full((1000, 700, 3), 255, dtype=np.uint8)
     # Draw simulated invoice text
-    cv2.putText(img_scan, "RECEIPT - GREENCARE CAFE", (60, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (20, 20, 20), 2)
+    cv2.putText(img_scan, "RECEIPT - IDP CAFE", (60, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (20, 20, 20), 2)
     cv2.putText(img_scan, "Date: 2026-10-22  Time: 14:32", (60, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (40, 40, 40), 2)
     cv2.putText(img_scan, "Espresso Double        $4.50", (60, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (30, 30, 30), 2)
     cv2.putText(img_scan, "Croissant Butter       $3.75", (60, 300), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (30, 30, 30), 2)
@@ -316,13 +316,13 @@ def run_benchmark(corpus_dir: Path, output_csv: Path, output_md: Path):
         except Exception:
             pass
         if "clean_scanned" in str(f_path).lower():
-            return {"type": "text_document", "detected_text": "RECEIPT GREENCARE CAFE Total $8.25"}
+            return {"type": "text_document", "detected_text": "RECEIPT IDP CAFE Total $8.25"}
         return {"type": "general_image", "detected_text": ""}
     orchestrator.classify_and_route_image = benchmark_classify_handler
 
     records: List[Dict[str, Any]] = []
     print("\n" + "=" * 80)
-    print(" PRAMAAN IDP — PERFORMANCE & ACCURACY BENCHMARK RUN")
+    print(" IDP — PERFORMANCE & ACCURACY BENCHMARK RUN")
     print("=" * 80)
 
     for idx, f in enumerate(files, 1):
@@ -374,7 +374,7 @@ def run_benchmark(corpus_dir: Path, output_csv: Path, output_md: Path):
     avg_cost_per_doc = round(total_cost / max(1, total_docs), 6)
 
     # Generate Markdown Report
-    md_content = f"""# Greencare AI / Pramaan IDP — Benchmark Results
+    md_content = f"""# IDP — Benchmark Results
 
 **Date Generated:** 2026-10-22  
 **Corpus Size:** {total_docs} diverse documents (Digital PDF, Scanned Images, Mobile Photos, DOCX, XLSX, CSV, Corrupt)  
@@ -436,7 +436,7 @@ Results are saved to:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Pramaan IDP Production Benchmark Runner")
+    parser = argparse.ArgumentParser(description="IDP Production Benchmark Runner")
     parser.add_argument("--corpus-dir", type=Path, default=PROJECT_ROOT / "benchmark_corpus",
                         help="Path to document directory for benchmark")
     parser.add_argument("--output-csv", type=Path, default=PROJECT_ROOT / "benchmark_results.csv",

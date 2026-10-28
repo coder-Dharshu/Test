@@ -1,6 +1,6 @@
 """
-Greencare AI — Lego 1: API Gateway + Data Serialization (The Baseplate)
-=======================================================================
+IDP — Lego 1: API Gateway + Data Serialization (The Baseplate)
+==============================================================
 Responsibilities (per blueprint §3.1):
   • Primary public API ingestion gateway
   • Token-based authorization
@@ -59,7 +59,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-SECRET_KEY       = os.environ.get("SECRET_KEY", "greencare-dev-secret-change-in-production")
+SECRET_KEY       = os.environ.get("SECRET_KEY", "idp-dev-secret-change-in-production")
 ALGORITHM        = "HS256"
 ACCESS_TOKEN_TTL = int(os.environ.get("TOKEN_TTL_MINUTES", "1440"))  # 24h default
 
@@ -104,7 +104,7 @@ job_registry: dict[str, dict] = {}
 # App setup
 # ---------------------------------------------------------------------------
 app = FastAPI(
-    title="Greencare AI — API Gateway (Lego 1)",
+    title="IDP — API Gateway (Lego 1)",
     description=(
         "Core baseplate gateway. Handles ingestion, authorization, "
         "multi-page table stitching, and JSON/CSV/Excel serialization."
@@ -819,8 +819,8 @@ class TokenRequest(BaseModel):
     client_secret: str
 
 VALID_CLIENTS = {
-    os.environ.get("CLIENT_ID", "greencare_client"):
-    os.environ.get("CLIENT_SECRET", "greencare_secret_dev"),
+    os.environ.get("CLIENT_ID", "idp_client"):
+    os.environ.get("CLIENT_SECRET", "idp_secret_dev"),
 }
 
 @app.post("/auth/token", tags=["Authentication"])

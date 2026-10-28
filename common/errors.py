@@ -1,6 +1,6 @@
 """
-Standardized Error Taxonomy for Greencare AI / Pramaan IDP
-==========================================================
+Standardized Error Taxonomy for IDP Platform
+============================================
 Every API error returns {error_code, message, retryable}.
 """
 

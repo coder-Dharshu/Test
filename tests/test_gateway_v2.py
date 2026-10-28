@@ -96,7 +96,7 @@ class TestSearch:
 
     def test_search_finds_committed_document(self, client, committed_doc):
         """If a committed doc contains the keyword, search should find it."""
-        resp = client.get("/api/v1/search", params={"q": "GREENCARE_TEST_KEYWORD"})
+        resp = client.get("/api/v1/search", params={"q": "IDP_TEST_KEYWORD"})
         assert resp.status_code == 200
         data = resp.json()
         assert data["total_found"] >= 1
@@ -106,7 +106,7 @@ class TestSearch:
     def test_search_doc_type_filter(self, client, committed_doc):
         resp = client.get(
             "/api/v1/search",
-            params={"q": "GREENCARE_TEST_KEYWORD", "doc_type": "invoice"},
+            params={"q": "IDP_TEST_KEYWORD", "doc_type": "invoice"},
         )
         assert resp.status_code == 200
 

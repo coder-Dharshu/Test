@@ -1,5 +1,5 @@
 """
-Greencare AI — Lego 1: Celery Worker  [UPGRADED v2]
+IDP — Lego 1: Celery Worker  [UPGRADED v2]
 ====================================================
 New in v2:
   • Webhook POST dispatch on job completion (pending_review / committed / rejected)
@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 
 celery_app = Celery(
-    "greencare_tasks",
+    "idp_tasks",
     broker=REDIS_URL,
     backend=REDIS_URL,
 )
@@ -66,7 +66,7 @@ PENDING_DIR  = "./pending_review"
 UPLOAD_DIR   = "./temp_uploads"
 LEGO2_TEMP   = "./lego2_temp"
 WEBHOOK_FILE = "./webhook_registry.json"
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "greencare-webhook-secret")
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "idp-webhook-secret")
 
 # Cleanup thresholds (hours)
 UPLOAD_CLEANUP_HOURS  = int(os.environ.get("UPLOAD_CLEANUP_HOURS",  "24"))
@@ -116,8 +116,8 @@ def _dispatch_webhooks(event: str, payload: dict):
     sig = _sign_payload(payload)
     headers = {
         "Content-Type": "application/json",
-        "X-Greencare-Event": event,
-        "X-Greencare-Signature": f"sha256={sig}",
+        "X-IDP-Event": event,
+        "X-IDP-Signature": f"sha256={sig}",
     }
     for hook_id, hook in hooks.items():
         url = hook.get("url")

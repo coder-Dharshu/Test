@@ -1,5 +1,5 @@
 """
-Greencare AI — Lego 5: Analytics Service  [v2.1 Production Refactor]
+IDP — Lego 5: Analytics Service  [v2.1 Production Refactor]
 =====================================================================
 Observability, KPI metrics computation, cost tracking, and live dashboard.
 
@@ -53,7 +53,7 @@ def get_rejected_dir() -> str:
 # App Setup
 # ---------------------------------------------------------------------------
 app = FastAPI(
-    title="Greencare AI — Analytics Service",
+    title="IDP — Analytics Service",
     description="Real-time pipeline metrics, cost accounting, and health observability.",
     version="2.1.0",
 )
@@ -270,7 +270,7 @@ def metrics_export_csv():
     output = io.StringIO()
     writer = csv.writer(output)
 
-    writer.writerow(["Greencare AI IDP — Metrics Report"])
+    writer.writerow(["IDP Platform — Metrics Report"])
     writer.writerow(["Generated At", m["generated_at"]])
     writer.writerow([])
     writer.writerow(["Metric", "Value"])

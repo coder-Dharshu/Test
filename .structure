@@ -1,4 +1,4 @@
-greencare-ai/
+idp/
 ├── .github/
 │   └── workflows/
 │       └── ci.yml                     # GitHub Actions CI workflow (Ruff lint + Pytest suite)

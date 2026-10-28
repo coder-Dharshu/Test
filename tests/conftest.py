@@ -94,7 +94,7 @@ def committed_doc(tmp_dirs):
         "_pipeline":    "fast_track_cpu",
         "_approved_at": "2026-08-01T10:00:00Z",
         "document_type": "invoice",
-        "extracted_text": "This is a GREENCARE_TEST_KEYWORD for testing search.",
+        "extracted_text": "This is a IDP_TEST_KEYWORD for testing search.",
         "key_value_pairs": {"Invoice No": "TEST-001"},
         "tables": [],
     }

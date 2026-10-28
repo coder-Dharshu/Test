@@ -1,6 +1,6 @@
 """
-Greencare AI — Lego 2: CPU Triage  [UPGRADED v2]
-=================================================
+IDP — Lego 2: CPU Triage  [UPGRADED v2]
+========================================
 New in v2:
   • .docx support via python-docx (fast-track, no VLM call)
   • .xlsx / .xls support via openpyxl (tables extracted natively)
@@ -57,7 +57,7 @@ logger = logging.getLogger(__name__)
 # App
 # ---------------------------------------------------------------------------
 app = FastAPI(
-    title="Greencare AI — Lego 2: CPU Triage",
+    title="IDP — Lego 2: CPU Triage",
     description=(
         "Fast-tracks digital PDFs, .docx, .xlsx, and .csv files. "
         "Preprocesses images with deskew and glare-suppression before Qwen 3.6 27B."

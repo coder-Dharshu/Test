@@ -3,10 +3,11 @@ import json
 from pathlib import Path
 
 def main():
-    file_path = Path(r"C:\Users\DARSHAN\OneDrive\Desktop\PROGO-OCR\PROGO-OCR\greencare-ai\temp_uploads\4065a2b2-02d7-4a5f-bc51-830d0201cf78_WhatsApp Image 2026-05-30 at 11.31.29 AM.jpeg")
-    if not file_path.exists():
-        print("File not found.")
+    sample_files = list(Path("./temp_uploads").glob("*.*"))
+    if not sample_files:
+        print("No test file found in ./temp_uploads.")
         return
+    file_path = sample_files[0]
 
     with open(file_path, "rb") as f:
         print("Sending POST request to /api/v1/ingest...")

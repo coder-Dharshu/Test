@@ -129,10 +129,10 @@ class AppConfig(BaseModel):
 
     # Security
     SECRET_KEY: str = Field(
-        default_factory=lambda: os.getenv("SECRET_KEY", "greencare-dev-secret-change-in-production")
+        default_factory=lambda: os.getenv("SECRET_KEY", "idp-dev-secret-change-in-production")
     )
     WEBHOOK_SECRET: str = Field(
-        default_factory=lambda: os.getenv("WEBHOOK_SECRET", "greencare-webhook-secret-change-in-production")
+        default_factory=lambda: os.getenv("WEBHOOK_SECRET", "idp-webhook-secret-change-in-production")
     )
     ANALYTICS_API_KEY: str = Field(
         default_factory=lambda: os.getenv("ANALYTICS_API_KEY", "")

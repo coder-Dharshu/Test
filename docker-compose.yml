@@ -1,6 +1,6 @@
 
 # ============================================================
-# Greencare AI — Docker Compose Orchestration  [v2]
+# IDP Platform — Docker Compose Orchestration  [v2]
 # ============================================================
 # Services:
 #   redis             → Celery message broker + result backend
@@ -19,7 +19,7 @@ services:
   # ──────────────────────────────────────────────────────────
   redis:
     image: redis:7-alpine
-    container_name: greencare-redis
+    container_name: idp-redis
     restart: unless-stopped
     ports:
       - "6379:6379"
@@ -38,7 +38,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: greencare-gateway
+    container_name: idp-gateway
     restart: unless-stopped
     command: uvicorn lego1_gateway.main:app --host 0.0.0.0 --port 8000 --reload
     ports:
@@ -53,8 +53,8 @@ services:
       - QWEN_API_KEY=${QWEN_API_KEY:-${GROQ_API_KEY}}
       - LOCAL_MODEL_URL=${LOCAL_MODEL_URL:-http://ollama:11434/v1}
       - LOCAL_MODEL_NAME=${LOCAL_MODEL_NAME:-qwen3.6:27b}
-      - SECRET_KEY=${SECRET_KEY:-greencare-dev-secret}
-      - WEBHOOK_SECRET=${WEBHOOK_SECRET:-greencare-webhook-secret}
+      - SECRET_KEY=${SECRET_KEY:-idp-dev-secret}
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET:-idp-webhook-secret}
     volumes:
       - shared_uploads:/app/temp_uploads
       - shared_pending:/app/pending_review
@@ -72,7 +72,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: greencare-worker
+    container_name: idp-worker
     restart: unless-stopped
     command: celery -A lego1_gateway.worker.celery_app worker --loglevel=info --concurrency=4
     environment:
@@ -85,7 +85,7 @@ services:
       - QWEN_API_KEY=${QWEN_API_KEY:-${GROQ_API_KEY}}
       - LOCAL_MODEL_URL=${LOCAL_MODEL_URL:-http://ollama:11434/v1}
       - LOCAL_MODEL_NAME=${LOCAL_MODEL_NAME:-qwen3.6:27b}
-      - WEBHOOK_SECRET=${WEBHOOK_SECRET:-greencare-webhook-secret}
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET:-idp-webhook-secret}
       - UPLOAD_CLEANUP_HOURS=${UPLOAD_CLEANUP_HOURS:-24}
       - LEGO2_TEMP_CLEANUP_HOURS=${LEGO2_TEMP_CLEANUP_HOURS:-1}
     volumes:
@@ -110,7 +110,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: greencare-beat
+    container_name: idp-beat
     restart: unless-stopped
     command: celery -A lego1_gateway.worker.celery_app beat --loglevel=info
     environment:
@@ -131,7 +131,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: greencare-triage
+    container_name: idp-triage
     restart: unless-stopped
     command: uvicorn lego2_triage.triage_service:app --host 0.0.0.0 --port 8001 --reload
     ports:
@@ -149,7 +149,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: greencare-qwen
+    container_name: idp-qwen
     restart: unless-stopped
     command: uvicorn lego3_qwen.qwen_engine:app --host 0.0.0.0 --port 8002 --reload
     ports:
@@ -171,7 +171,7 @@ services:
   # ──────────────────────────────────────────────────────────
   ollama:
     image: ollama/ollama:latest
-    container_name: greencare-ollama
+    container_name: idp-ollama
     profiles:
       - local
     ports:
@@ -186,7 +186,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: greencare-hitl-streamlit
+    container_name: idp-hitl-streamlit
     restart: unless-stopped
     command: streamlit run smart_triage/smart_triage_hitl_app.py --server.port 8501 --server.address 0.0.0.0 --server.headless true
     ports:
@@ -211,7 +211,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: greencare-analytics
+    container_name: idp-analytics
     restart: unless-stopped
     command: uvicorn lego5_analytics.analytics_service:app --host 0.0.0.0 --port 8003 --reload
     ports:
